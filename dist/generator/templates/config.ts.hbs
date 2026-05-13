@@ -1,0 +1,11 @@
+export const project = "{{project}}";
+export const env = "{{env}}";
+export const prefix = `${project}-${env}`;
+export const region = "{{region}}";
+
+export const rootDomain = "{{rootDomain}}";
+{{#each servicesWithDomain}}
+export const {{camel name}}Domain = "{{domain}}";
+{{/each}}
+
+export const ecrImage = "{{fullImage}}";

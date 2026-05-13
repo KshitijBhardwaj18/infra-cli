@@ -1,0 +1,116 @@
+import * as pulumi from "@pulumi/pulumi";
+import * as aws from "@pulumi/aws";
+import * as crypto from "crypto";
+import { prefix } from "../config";
+{{#if hasDatabase}}{{#if hasCache}}
+import { privateSubnet1, privateSubnet2, rdsSg, redisSg } from "./networking";
+{{else}}
+import { privateSubnet1, privateSubnet2, rdsSg } from "./networking";
+{{/if}}{{else}}{{#if hasCache}}
+import { privateSubnet1, privateSubnet2, redisSg } from "./networking";
+{{/if}}{{/if}}
+
+const dbPasswordSecret = new aws.secretsmanager.Secret(`${prefix}-db-password`, {
+  name: `${prefix}/db-password`,
+});
+
+export const dbPasswordValue = new aws.secretsmanager.SecretVersion(`${prefix}-db-password-value`, {
+  secretId: dbPasswordSecret.id,
+  secretString: pulumi.secret(crypto.randomBytes(24).toString("hex")),
+});
+
+const authSecretSecret = new aws.secretsmanager.Secret(`${prefix}-auth-secret`, {
+  name: `${prefix}/better-auth-secret`,
+});
+
+export const authSecretValue = new aws.secretsmanager.SecretVersion(`${prefix}-auth-secret-value`, {
+  secretId: authSecretSecret.id,
+  secretString: pulumi.secret(crypto.randomBytes(32).toString("hex")),
+});
+
+{{#if hasSmtp}}
+const smtpSecretSecret = new aws.secretsmanager.Secret(`${prefix}-smtp-credentials`, {
+  name: `${prefix}/smtp-credentials`,
+});
+
+export const smtpSecretValue = new aws.secretsmanager.SecretVersion(`${prefix}-smtp-credentials-value`, {
+  secretId: smtpSecretSecret.id,
+  secretString: pulumi.secret(JSON.stringify({
+    user: process.env.HEIZEN_SMTP_USER ?? "",
+    password: process.env.HEIZEN_SMTP_PASSWORD ?? "",
+  })),
+});
+{{/if}}
+
+{{#if hasDatabase}}
+const dbSubnetGroup = new aws.rds.SubnetGroup(`${prefix}-db-subnet`, {
+  subnetIds: [privateSubnet1.id, privateSubnet2.id],
+  tags: { Name: `${prefix}-db-subnet` },
+});
+
+export const db = new aws.rds.Instance(`${prefix}-db`, {
+  identifier: `${prefix}-db`,
+  engine: "postgres",
+  engineVersion: "{{database.engineVersion}}",
+  instanceClass: "{{database.instanceClass}}",
+  allocatedStorage: {{database.allocatedStorage}},
+  storageType: "{{database.storageType}}",
+  dbName: "{{database.dbName}}",
+  username: "postgres",
+  password: dbPasswordValue.secretString.apply(s => s || ""),
+  dbSubnetGroupName: dbSubnetGroup.name,
+  vpcSecurityGroupIds: [rdsSg.id],
+  publiclyAccessible: false,
+  storageEncrypted: {{database.encrypted}},
+  backupRetentionPeriod: {{database.backupRetentionPeriod}},
+  deletionProtection: {{database.deletionProtection}},
+  skipFinalSnapshot: false,
+  finalSnapshotIdentifier: `${prefix}-db-final-snapshot`,
+  tags: { Name: `${prefix}-db` },
+});
+{{/if}}
+
+{{#if hasCache}}
+const redisSubnetGroup = new aws.elasticache.SubnetGroup(`${prefix}-redis-subnet`, {
+  subnetIds: [privateSubnet1.id, privateSubnet2.id],
+  tags: { Name: `${prefix}-redis-subnet` },
+});
+
+export const redis = new aws.elasticache.Cluster(`${prefix}-redis`, {
+  clusterId: `${prefix}-redis`,
+  engine: "redis",
+  engineVersion: "{{cache.engineVersion}}",
+  nodeType: "{{cache.nodeType}}",
+  numCacheNodes: 1,
+  subnetGroupName: redisSubnetGroup.name,
+  securityGroupIds: [redisSg.id],
+  tags: { Name: `${prefix}-redis` },
+});
+{{/if}}
+
+{{#if hasStorage}}
+export const bucket = new aws.s3.Bucket(`${prefix}-files`, {
+  bucket: `${prefix}-files-${crypto.randomBytes(6).toString("hex")}`,
+  tags: { Name: `${prefix}-files` },
+});
+
+new aws.s3.BucketVersioning(`${prefix}-files-versioning`, {
+  bucket: bucket.id,
+  versioningConfiguration: { status: "Enabled" },
+});
+
+new aws.s3.BucketServerSideEncryptionConfiguration(`${prefix}-files-encryption`, {
+  bucket: bucket.id,
+  rules: [{
+    applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
+  }],
+});
+
+new aws.s3.BucketPublicAccessBlock(`${prefix}-files-block`, {
+  bucket: bucket.id,
+  blockPublicAcls: true,
+  ignorePublicAcls: true,
+  blockPublicPolicy: true,
+  restrictPublicBuckets: true,
+});
+{{/if}}

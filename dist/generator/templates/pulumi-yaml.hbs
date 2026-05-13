@@ -1,0 +1,10 @@
+name: {{project}}-infra
+description: {{project}} {{env}} infrastructure
+runtime:
+  name: nodejs
+  options:
+    packagemanager: npm
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-typescript
