@@ -79,6 +79,14 @@ new aws.s3.BucketServerSideEncryptionConfiguration(`${prefix}-files-encryption`,
     applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
   }],
 });
+
+new aws.s3.BucketPublicAccessBlock(`${prefix}-files-block`, {
+  bucket: bucket.id,
+  blockPublicAcls: true,
+  ignorePublicAcls: true,
+  blockPublicPolicy: true,
+  restrictPublicBuckets: true,
+});
 {{/if}}
 
 {{#unless hasDatabase}}{{#unless hasCache}}{{#unless hasStorage}}

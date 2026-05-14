@@ -1,9 +1,26 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
-import { prefix, region, rootDomain, adminDomain, apiDomain, ecrImage } from "../config";
+import { prefix, region, rootDomain, apiDomain, webDomain, ecrImage } from "../config";
 import { privateSubnet1, privateSubnet2, ecsSg } from "./networking";
 import { db, redis, bucket, dbPassword } from "./store";
-import { apiTg, adminTg, orgTg } from "./loadbalancer";
+import { apiTg, webTg } from "./loadbalancer";
+
+// Reference implementation of the compute layer the CLI generates.
+//
+// What is auto-injected by the generator:
+//   - NODE_ENV          → "production"          (backend/worker services)
+//   - DATABASE_URL      → composed from db.endpoint + dbPassword (never a standalone DATABASE_PASSWORD)
+//   - REDIS_URL         → from redis cluster endpoint
+//   - AWS_S3_BUCKET     → bucket.bucket
+//   - AWS_S3_REGION     → region
+//   - PORT              → service port (frontend services only)
+//
+// Everything else (app secrets, app env vars) comes from heizen.env.yaml:
+//   - Secrets:  config.requireSecret("...") in store.ts, then injected by name
+//   - Env vars: literal values from heizen.env.yaml `env:` sections
+//
+// The template does NOT inject framework-specific vars (NEXT_PUBLIC_*, BETTER_AUTH_*,
+// SMTP_*, CORS_URLS, etc). If your app needs them, declare them in init.
 
 const ecsAssumeRole = JSON.stringify({
   Version: "2012-10-17",
@@ -22,23 +39,6 @@ const executionRole = new aws.iam.Role(`${prefix}-ecs-execution-role`, {
 new aws.iam.RolePolicyAttachment(`${prefix}-ecs-execution-policy`, {
   role: executionRole.name,
   policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
-});
-
-new aws.iam.RolePolicy(`${prefix}-ecr-cross-account`, {
-  role: executionRole.name,
-  policy: JSON.stringify({
-    Version: "2012-10-17",
-    Statement: [{
-      Effect: "Allow",
-      Action: [
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-      ],
-      Resource: "*",
-    }],
-  }),
 });
 
 const s3Policy = pulumi.interpolate`{
@@ -79,28 +79,13 @@ new aws.iam.RolePolicy(`${prefix}-api-ssm-policy`, {
   policy: ssmPolicy,
 });
 
-const workerTaskRole = new aws.iam.Role(`${prefix}-worker-task-role`, {
-  name: `${prefix}-worker-task-role`,
+const webTaskRole = new aws.iam.Role(`${prefix}-web-task-role`, {
+  name: `${prefix}-web-task-role`,
   assumeRolePolicy: ecsAssumeRole,
 });
 
-new aws.iam.RolePolicy(`${prefix}-worker-s3-policy`, {
-  role: workerTaskRole.name,
-  policy: s3Policy,
-});
-
-new aws.iam.RolePolicy(`${prefix}-worker-ssm-policy`, {
-  role: workerTaskRole.name,
-  policy: ssmPolicy,
-});
-
-const frontendsTaskRole = new aws.iam.Role(`${prefix}-frontends-task-role`, {
-  name: `${prefix}-frontends-task-role`,
-  assumeRolePolicy: ecsAssumeRole,
-});
-
-new aws.iam.RolePolicy(`${prefix}-frontends-ssm-policy`, {
-  role: frontendsTaskRole.name,
+new aws.iam.RolePolicy(`${prefix}-web-ssm-policy`, {
+  role: webTaskRole.name,
   policy: ssmPolicy,
 });
 
@@ -109,13 +94,8 @@ new aws.cloudwatch.LogGroup(`${prefix}-api-logs`, {
   retentionInDays: 90,
 });
 
-new aws.cloudwatch.LogGroup(`${prefix}-frontends-logs`, {
-  name: `/ecs/${prefix}/frontends`,
-  retentionInDays: 90,
-});
-
-new aws.cloudwatch.LogGroup(`${prefix}-worker-logs`, {
-  name: `/ecs/${prefix}/worker`,
+new aws.cloudwatch.LogGroup(`${prefix}-web-logs`, {
+  name: `/ecs/${prefix}/web`,
   retentionInDays: 90,
 });
 
@@ -128,32 +108,25 @@ export const cluster = new aws.ecs.Cluster(`${prefix}-cluster`, {
 const redisEndpoint = redis.cacheNodes.apply((nodes: any) => nodes[0].address);
 const redisPort = redis.cacheNodes.apply((nodes: any) => nodes[0].port.toString());
 
+// Backend (api) — auto-injected vars only. App-specific vars would come from
+// the user's `env:` config and be appended as additional out.push({ ... }).
 const apiEnvironment = pulumi.all([
   db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket,
-]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName]) => [
-  { name: "NODE_ENV", value: "production" },
-  { name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/workforce` },
-  { name: "REDIS_URL", value: `redis://${rHost}:${rPort}` },
-  { name: "BETTER_AUTH_URL", value: `https://${apiDomain}` },
-  { name: "BETTER_AUTH_DOMAIN", value: `.${rootDomain}` },
-  { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
-  { name: "ORG_PORTAL_BASE_URL", value: `https://${rootDomain}` },
-  { name: "API_URL", value: `https://${apiDomain}` },
-  { name: "CORS_URLS", value: `https://${adminDomain},https://*.${rootDomain}` },
-  { name: "AWS_S3_REGION", value: region },
-  { name: "AWS_S3_BUCKET", value: `${bucketName}` },
-]);
+]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName]) => {
+  const out: Array<{ name: string; value: string }> = [];
+  out.push({ name: "NODE_ENV", value: "production" });
+  out.push({ name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/example` });
+  out.push({ name: "REDIS_URL", value: `redis://${rHost}:${rPort}` });
+  out.push({ name: "AWS_S3_BUCKET", value: `${bucketName}` });
+  out.push({ name: "AWS_S3_REGION", value: region });
+  return out;
+});
 
-const workerEnvironment = pulumi.all([
-  db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket,
-]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName]) => [
-  { name: "NODE_ENV", value: "production" },
-  { name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/workforce` },
-  { name: "REDIS_URL", value: `redis://${rHost}:${rPort}` },
-  { name: "AWS_S3_REGION", value: region },
-  { name: "AWS_S3_BUCKET", value: `${bucketName}` },
-  { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
-  { name: "ORG_PORTAL_BASE_URL", value: `https://${rootDomain}` },
+// Frontend (web) — only PORT is auto-injected. Note: no NEXT_PUBLIC_* or other
+// framework assumptions. Any public env the framework needs at build/runtime
+// must be declared by the user in heizen.env.yaml.
+const webEnvironment = pulumi.output([
+  { name: "PORT", value: "3000" },
 ]);
 
 const apiTaskDef = new aws.ecs.TaskDefinition(`${prefix}-api-task`, {
@@ -164,12 +137,12 @@ const apiTaskDef = new aws.ecs.TaskDefinition(`${prefix}-api-task`, {
   memory: "1024",
   executionRoleArn: executionRole.arn,
   taskRoleArn: apiTaskRole.arn,
-  containerDefinitions: apiEnvironment.apply(env =>
+  containerDefinitions: apiEnvironment.apply((env) =>
     JSON.stringify([{
       name: "api",
       image: ecrImage,
       essential: true,
-      command: ["sh", "-c", "npm run db:deploy && node apps/server/dist/src/main.js"],
+      command: ["sh", "-c", "node dist/main.js"],
       portMappings: [{ containerPort: 3001, protocol: "tcp" }],
       environment: env,
       logConfiguration: {
@@ -184,65 +157,28 @@ const apiTaskDef = new aws.ecs.TaskDefinition(`${prefix}-api-task`, {
   ),
 });
 
-const frontendsTaskDef = new aws.ecs.TaskDefinition(`${prefix}-frontends-task`, {
-  family: `${prefix}-frontends`,
+const webTaskDef = new aws.ecs.TaskDefinition(`${prefix}-web-task`, {
+  family: `${prefix}-web`,
   networkMode: "awsvpc",
   requiresCompatibilities: ["FARGATE"],
   cpu: "256",
   memory: "1024",
   executionRoleArn: executionRole.arn,
-  taskRoleArn: frontendsTaskRole.arn,
-  containerDefinitions: pulumi.output(JSON.stringify([{
-    name: "frontends",
-    image: ecrImage,
-    essential: true,
-    command: ["sh", "-c", "npx turbo run start --filter=admin-web --filter=org-web"],
-    portMappings: [
-      { containerPort: 3000, protocol: "tcp" },
-      { containerPort: 3002, protocol: "tcp" },
-    ],
-    environment: [
-      { name: "NEXT_PUBLIC_APP_URL", value: `https://${adminDomain}` },
-      { name: "NEXT_PUBLIC_API_URL", value: `https://${apiDomain}` },
-      { name: "NEXT_PUBLIC_BETTER_AUTH_URL", value: `https://${apiDomain}` },
-      { name: "PORT", value: "3000" },
-      { name: "NEXT_PUBLIC_ORG_PORTAL_PROTOCOL", value: "https" },
-      { name: "NEXT_PUBLIC_APP_DOMAIN", value: rootDomain },
-      { name: "NEXT_PUBLIC_LANDING_URL", value: `https://${rootDomain}` },
-      { name: "NEXT_PUBLIC_ORG_PORTAL_DOMAIN", value: rootDomain },
-    ],
-    logConfiguration: {
-      logDriver: "awslogs",
-      options: {
-        "awslogs-group": `/ecs/${prefix}/frontends`,
-        "awslogs-region": region,
-        "awslogs-stream-prefix": "frontends",
-      },
-    },
-  }])),
-});
-
-const workerTaskDef = new aws.ecs.TaskDefinition(`${prefix}-worker-task`, {
-  family: `${prefix}-worker`,
-  networkMode: "awsvpc",
-  requiresCompatibilities: ["FARGATE"],
-  cpu: "256",
-  memory: "512",
-  executionRoleArn: executionRole.arn,
-  taskRoleArn: workerTaskRole.arn,
-  containerDefinitions: workerEnvironment.apply(env =>
+  taskRoleArn: webTaskRole.arn,
+  containerDefinitions: webEnvironment.apply((env) =>
     JSON.stringify([{
-      name: "worker",
+      name: "web",
       image: ecrImage,
       essential: true,
-      command: ["sh", "-c", "bun run apps/worker/src/main.ts"],
+      command: ["sh", "-c", "npm run start"],
+      portMappings: [{ containerPort: 3000, protocol: "tcp" }],
       environment: env,
       logConfiguration: {
         logDriver: "awslogs",
         options: {
-          "awslogs-group": `/ecs/${prefix}/worker`,
+          "awslogs-group": `/ecs/${prefix}/web`,
           "awslogs-region": region,
-          "awslogs-stream-prefix": "worker",
+          "awslogs-stream-prefix": "web",
         },
       },
     }]),
@@ -262,51 +198,32 @@ export const apiService = new aws.ecs.Service(`${prefix}-api-service`, {
     securityGroups: [ecsSg.id],
     assignPublicIp: false,
   },
-  loadBalancers: [{
-    targetGroupArn: apiTg.arn,
-    containerName: "api",
-    containerPort: 3001,
-  }],
+  loadBalancers: [
+    { targetGroupArn: apiTg.arn, containerName: "api", containerPort: 3001 },
+  ],
   deploymentCircuitBreaker: { enable: true, rollback: true },
   tags: { Name: `${prefix}-api` },
 }, { dependsOn: [db, redis] });
 
-export const frontendsService = new aws.ecs.Service(`${prefix}-frontends-service`, {
-  name: `${prefix}-frontends`,
+export const webService = new aws.ecs.Service(`${prefix}-web-service`, {
+  name: `${prefix}-web`,
   cluster: cluster.arn,
-  taskDefinition: frontendsTaskDef.arn,
+  taskDefinition: webTaskDef.arn,
   desiredCount: 1,
   launchType: "FARGATE",
   enableExecuteCommand: true,
-  healthCheckGracePeriodSeconds: 60,
+  healthCheckGracePeriodSeconds: 120,
   networkConfiguration: {
     subnets: [privateSubnet1.id, privateSubnet2.id],
     securityGroups: [ecsSg.id],
     assignPublicIp: false,
   },
   loadBalancers: [
-    { targetGroupArn: adminTg.arn, containerName: "frontends", containerPort: 3000 },
-    { targetGroupArn: orgTg.arn, containerName: "frontends", containerPort: 3002 },
+    { targetGroupArn: webTg.arn, containerName: "web", containerPort: 3000 },
   ],
   deploymentCircuitBreaker: { enable: true, rollback: true },
-  tags: { Name: `${prefix}-frontends` },
+  tags: { Name: `${prefix}-web` },
 });
-
-export const workerService = new aws.ecs.Service(`${prefix}-worker-service`, {
-  name: `${prefix}-worker`,
-  cluster: cluster.arn,
-  taskDefinition: workerTaskDef.arn,
-  desiredCount: 1,
-  launchType: "FARGATE",
-  enableExecuteCommand: true,
-  networkConfiguration: {
-    subnets: [privateSubnet1.id, privateSubnet2.id],
-    securityGroups: [ecsSg.id],
-    assignPublicIp: false,
-  },
-  deploymentCircuitBreaker: { enable: true, rollback: true },
-  tags: { Name: `${prefix}-worker` },
-}, { dependsOn: [db, redis] });
 
 const apiScalingTarget = new aws.appautoscaling.Target(`${prefix}-api-scaling`, {
   maxCapacity: 10,
@@ -322,28 +239,6 @@ new aws.appautoscaling.Policy(`${prefix}-api-cpu-scaling`, {
   resourceId: apiScalingTarget.resourceId,
   scalableDimension: apiScalingTarget.scalableDimension,
   serviceNamespace: apiScalingTarget.serviceNamespace,
-  targetTrackingScalingPolicyConfiguration: {
-    predefinedMetricSpecification: {
-      predefinedMetricType: "ECSServiceAverageCPUUtilization",
-    },
-    targetValue: 70,
-  },
-});
-
-const frontendsScalingTarget = new aws.appautoscaling.Target(`${prefix}-frontends-scaling`, {
-  maxCapacity: 3,
-  minCapacity: 1,
-  resourceId: pulumi.interpolate`service/${cluster.name}/${frontendsService.name}`,
-  scalableDimension: "ecs:service:DesiredCount",
-  serviceNamespace: "ecs",
-});
-
-new aws.appautoscaling.Policy(`${prefix}-frontends-cpu-scaling`, {
-  name: `${prefix}-frontends-cpu-scaling`,
-  policyType: "TargetTrackingScaling",
-  resourceId: frontendsScalingTarget.resourceId,
-  scalableDimension: frontendsScalingTarget.scalableDimension,
-  serviceNamespace: frontendsScalingTarget.serviceNamespace,
   targetTrackingScalingPolicyConfiguration: {
     predefinedMetricSpecification: {
       predefinedMetricType: "ECSServiceAverageCPUUtilization",

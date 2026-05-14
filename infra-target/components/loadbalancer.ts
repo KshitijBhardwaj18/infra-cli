@@ -1,8 +1,6 @@
 import * as aws from "@pulumi/aws";
-import { prefix, rootDomain, adminDomain, apiDomain } from "../config";
+import { prefix, rootDomain, apiDomain, webDomain } from "../config";
 import { vpc, publicSubnet1, publicSubnet2, albSg } from "./networking";
-
-// ---- ACM Certificate ----
 
 export const cert = new aws.acm.Certificate(`${prefix}-cert`, {
   domainName: `*.${rootDomain}`,
@@ -10,8 +8,6 @@ export const cert = new aws.acm.Certificate(`${prefix}-cert`, {
   validationMethod: "DNS",
   tags: { Name: `${prefix}-cert` },
 });
-
-// ---- ALB ----
 
 export const alb = new aws.lb.LoadBalancer(`${prefix}-alb`, {
   name: `${prefix}-alb`,
@@ -22,8 +18,6 @@ export const alb = new aws.lb.LoadBalancer(`${prefix}-alb`, {
   tags: { Name: `${prefix}-alb` },
 });
 
-// ---- Target Groups ----
-
 export const apiTg = new aws.lb.TargetGroup(`${prefix}-api-tg`, {
   name: `${prefix}-api-tg`,
   port: 3001,
@@ -31,8 +25,8 @@ export const apiTg = new aws.lb.TargetGroup(`${prefix}-api-tg`, {
   vpcId: vpc.id,
   targetType: "ip",
   healthCheck: {
-    path: "/api",
-    matcher: "200-499",
+    path: "/health",
+    matcher: "200-399",
     interval: 30,
     timeout: 5,
     healthyThreshold: 3,
@@ -41,41 +35,22 @@ export const apiTg = new aws.lb.TargetGroup(`${prefix}-api-tg`, {
   tags: { Name: `${prefix}-api-tg` },
 });
 
-export const adminTg = new aws.lb.TargetGroup(`${prefix}-admin-tg`, {
-  name: `${prefix}-admin-tg`,
+export const webTg = new aws.lb.TargetGroup(`${prefix}-web-tg`, {
+  name: `${prefix}-web-tg`,
   port: 3000,
   protocol: "HTTP",
   vpcId: vpc.id,
   targetType: "ip",
   healthCheck: {
     path: "/",
-    matcher: "200-499",
+    matcher: "200-399",
     interval: 30,
     timeout: 5,
     healthyThreshold: 3,
     unhealthyThreshold: 2,
   },
-  tags: { Name: `${prefix}-admin-tg` },
+  tags: { Name: `${prefix}-web-tg` },
 });
-
-export const orgTg = new aws.lb.TargetGroup(`${prefix}-org-tg`, {
-  name: `${prefix}-org-tg`,
-  port: 3002,
-  protocol: "HTTP",
-  vpcId: vpc.id,
-  targetType: "ip",
-  healthCheck: {
-    path: "/",
-    matcher: "200-499",
-    interval: 30,
-    timeout: 5,
-    healthyThreshold: 3,
-    unhealthyThreshold: 2,
-  },
-  tags: { Name: `${prefix}-org-tg` },
-});
-
-// ---- Listeners ----
 
 new aws.lb.Listener(`${prefix}-http-listener`, {
   loadBalancerArn: alb.arn,
@@ -98,11 +73,9 @@ const httpsListener = new aws.lb.Listener(`${prefix}-https-listener`, {
   certificateArn: cert.arn,
   defaultActions: [{
     type: "forward",
-    targetGroupArn: adminTg.arn,
+    targetGroupArn: webTg.arn,
   }],
 });
-
-// ---- Routing Rules ----
 
 new aws.lb.ListenerRule(`${prefix}-api-rule`, {
   listenerArn: httpsListener.arn,
@@ -111,16 +84,9 @@ new aws.lb.ListenerRule(`${prefix}-api-rule`, {
   actions: [{ type: "forward", targetGroupArn: apiTg.arn }],
 });
 
-new aws.lb.ListenerRule(`${prefix}-admin-rule`, {
+new aws.lb.ListenerRule(`${prefix}-web-rule`, {
   listenerArn: httpsListener.arn,
   priority: 200,
-  conditions: [{ hostHeader: { values: [adminDomain] } }],
-  actions: [{ type: "forward", targetGroupArn: adminTg.arn }],
-});
-
-new aws.lb.ListenerRule(`${prefix}-org-rule`, {
-  listenerArn: httpsListener.arn,
-  priority: 300,
-  conditions: [{ hostHeader: { values: [`*.${rootDomain}`] } }],
-  actions: [{ type: "forward", targetGroupArn: orgTg.arn }],
+  conditions: [{ hostHeader: { values: [webDomain] } }],
+  actions: [{ type: "forward", targetGroupArn: webTg.arn }],
 });

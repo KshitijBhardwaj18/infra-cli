@@ -131,7 +131,6 @@ const {{camel name}}Environment = pulumi.all([
 {{/if}}{{#each secretConfigVars}}  out.push({ name: "{{envVar}}", value: `${ {{~configVar}}Val }` });
 {{/each}}{{#each envLiteral}}  out.push({ name: "{{name}}", value: {{jsonString value}} });
 {{/each}}{{#if isFrontend}}  out.push({ name: "PORT", value: "{{port}}" });
-  out.push({ name: "NEXT_PUBLIC_APP_DOMAIN", value: rootDomain });
 {{/if}}  return out;
 });
 

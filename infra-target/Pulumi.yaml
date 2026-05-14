@@ -1,5 +1,5 @@
-name: workforce-infra
-description: Workforce production infrastructure
+name: example-infra
+description: Example production infrastructure
 runtime:
   name: nodejs
   options:

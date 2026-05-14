@@ -211,48 +211,73 @@ async function provisionSecrets(secrets: SecretSpec[], pCtx: PulumiCtx): Promise
   }
 
   const localOverrides = readLocalSecrets();
+  const infraSecrets = secrets.filter(isInfrastructureSecret);
+  const appSecrets = secrets.filter((s) => !isInfrastructureSecret(s));
 
-  for (const spec of secrets) {
-    const pulumiKey = pulumiKeyFromEnvVar(spec.envVar);
-
-    if (await pulumiConfigExists(pulumiKey, pCtx)) {
-      success(`${spec.envVar} (already configured)`);
-      continue;
+  if (infraSecrets.length > 0) {
+    header("  Infrastructure (auto-managed):");
+    for (const spec of infraSecrets) {
+      await provisionOne(spec, pCtx, localOverrides);
     }
-
-    let value: string | undefined;
-    let source = "";
-
-    if (process.env[`HEIZEN_SECRET_${spec.envVar}`]) {
-      value = process.env[`HEIZEN_SECRET_${spec.envVar}`];
-      source = `HEIZEN_SECRET_${spec.envVar} env var`;
-    } else if (localOverrides[spec.envVar]) {
-      value = localOverrides[spec.envVar];
-      source = ".heizen.secrets";
-    } else if (spec.value) {
-      value = spec.value;
-      source = "heizen.env.yaml";
-    } else if (spec.generate) {
-      value = randomBytes(32).toString("hex");
-      source = "generated";
-    } else {
-      console.log();
-      info(`Secret "${spec.name}" (${spec.envVar}) needs a value.`);
-      value = await password({
-        message: `Value for ${spec.envVar}:`,
-        mask: "*",
-        validate: (v) => v.length > 0 || "A value is required.",
-      });
-      source = "prompted";
-    }
-
-    await execa(
-      "pulumi",
-      ["config", "set", "--secret", pulumiKey, value!],
-      pCtx,
-    );
-    success(`Set ${spec.envVar} in Pulumi config (${source})`);
+    console.log();
   }
+
+  if (appSecrets.length > 0) {
+    header("  Application:");
+    for (const spec of appSecrets) {
+      await provisionOne(spec, pCtx, localOverrides);
+    }
+  }
+}
+
+function isInfrastructureSecret(spec: SecretSpec): boolean {
+  return spec.name === "db-password";
+}
+
+async function provisionOne(
+  spec: SecretSpec,
+  pCtx: PulumiCtx,
+  localOverrides: Record<string, string>,
+): Promise<void> {
+  const pulumiKey = pulumiKeyFromEnvVar(spec.envVar);
+
+  if (await pulumiConfigExists(pulumiKey, pCtx)) {
+    success(`${spec.envVar} (already configured)`);
+    return;
+  }
+
+  let value: string | undefined;
+  let source = "";
+
+  if (process.env[`HEIZEN_SECRET_${spec.envVar}`]) {
+    value = process.env[`HEIZEN_SECRET_${spec.envVar}`];
+    source = `HEIZEN_SECRET_${spec.envVar} env var`;
+  } else if (localOverrides[spec.envVar]) {
+    value = localOverrides[spec.envVar];
+    source = ".heizen.secrets";
+  } else if (spec.value) {
+    value = spec.value;
+    source = "heizen.env.yaml";
+  } else if (spec.generate) {
+    value = randomBytes(32).toString("hex");
+    source = "generated";
+  } else {
+    console.log();
+    info(`Secret "${spec.name}" (${spec.envVar}) needs a value.`);
+    value = await password({
+      message: `Value for ${spec.envVar}:`,
+      mask: "*",
+      validate: (v) => v.length > 0 || "A value is required.",
+    });
+    source = "prompted";
+  }
+
+  await execa(
+    "pulumi",
+    ["config", "set", "--secret", pulumiKey, value!],
+    pCtx,
+  );
+  success(`${spec.envVar} (${source})`);
 }
 
 async function pulumiConfigExists(key: string, pCtx: PulumiCtx): Promise<boolean> {
