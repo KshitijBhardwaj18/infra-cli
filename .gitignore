@@ -1,1 +1,31 @@
-node_modules
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment / secrets
+.env
+.env.*
+.heizen.secrets
+heizen.env.yaml
+
+# Generated infra (test output of running the CLI in this repo)
+/infra/
+/heizen.yaml
+
+# Pulumi
+.pulumi/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
