@@ -7,7 +7,6 @@ import { input, confirm } from "@inquirer/prompts";
 import { validateConfig, validateEnvConfig } from "../schema/validator.js";
 import { readConfig, readEnvConfig } from "../files.js";
 import { failure, success, warn, warnBox } from "../ui.js";
-import { deleteAllProjectSecrets } from "../secrets.js";
 const DEFAULT_PASSPHRASE = "heizen-managed-passphrase";
 export async function runDestroy() {
     const cwd = process.cwd();
@@ -117,30 +116,8 @@ export async function runDestroy() {
         process.exit(1);
     }
     success("Infrastructure destroyed.");
-    const cleanSecrets = await confirm({
-        message: "Delete secrets from Secrets Manager?",
-        default: true,
-    });
-    if (cleanSecrets) {
-        const spinner = ora("Deleting secrets...").start();
-        try {
-            const deleted = await deleteAllProjectSecrets(cfg, envCfg.awsProfile);
-            spinner.stop();
-            if (deleted.length === 0) {
-                console.log(chalk.dim("  No secrets found to delete."));
-            }
-            else {
-                for (const name of deleted)
-                    success(`Deleted secret: ${name}`);
-            }
-        }
-        catch (err) {
-            spinner.fail("Failed to delete some secrets");
-            console.log(chalk.dim(formatExecError(err)));
-        }
-    }
     const deleteBucket = await confirm({
-        message: `Delete Pulumi state bucket (${stateBucket})?`,
+        message: `Delete Pulumi state bucket (${stateBucket})? This removes the encrypted secret config too.`,
         default: false,
     });
     if (deleteBucket) {

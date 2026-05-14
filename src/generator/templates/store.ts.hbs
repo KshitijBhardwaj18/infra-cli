@@ -1,6 +1,5 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
-import * as crypto from "crypto";
 import { prefix } from "../config";
 {{#if hasDatabase}}{{#if hasCache}}
 import { privateSubnet1, privateSubnet2, rdsSg, redisSg } from "./networking";
@@ -10,13 +9,15 @@ import { privateSubnet1, privateSubnet2, rdsSg } from "./networking";
 import { privateSubnet1, privateSubnet2, redisSg } from "./networking";
 {{/if}}{{/if}}
 
+{{#if hasAnySecrets}}
+const config = new pulumi.Config();
+
+{{#each allSecretConfigs}}
+export const {{configVar}} = config.requireSecret("{{configVar}}");
+{{/each}}
+{{/if}}
+
 {{#if hasDatabase}}
-const dbPasswordVersion = aws.secretsmanager.getSecretVersionOutput({
-  secretId: "{{database.dbPasswordSecretName}}",
-});
-
-export const dbPassword = dbPasswordVersion.secretString;
-
 const dbSubnetGroup = new aws.rds.SubnetGroup(`${prefix}-db-subnet`, {
   subnetIds: [privateSubnet1.id, privateSubnet2.id],
   tags: { Name: `${prefix}-db-subnet` },
@@ -31,7 +32,7 @@ export const db = new aws.rds.Instance(`${prefix}-db`, {
   storageType: "{{database.storageType}}",
   dbName: "{{database.dbName}}",
   username: "postgres",
-  password: dbPassword.apply(p => p || ""),
+  password: {{database.dbPasswordConfigVar}},
   dbSubnetGroupName: dbSubnetGroup.name,
   vpcSecurityGroupIds: [rdsSg.id],
   publiclyAccessible: false,
@@ -41,7 +42,7 @@ export const db = new aws.rds.Instance(`${prefix}-db`, {
   skipFinalSnapshot: false,
   finalSnapshotIdentifier: `${prefix}-db-final-snapshot`,
   tags: { Name: `${prefix}-db` },
-});
+}, { ignoreChanges: ["password"] });
 {{/if}}
 
 {{#if hasCache}}
@@ -64,7 +65,6 @@ export const redis = new aws.elasticache.Cluster(`${prefix}-redis`, {
 
 {{#if hasStorage}}
 export const bucket = new aws.s3.Bucket(`${prefix}-files`, {
-  bucket: `${prefix}-files-${crypto.randomBytes(6).toString("hex")}`,
   tags: { Name: `${prefix}-files` },
 });
 
@@ -79,17 +79,8 @@ new aws.s3.BucketServerSideEncryptionConfiguration(`${prefix}-files-encryption`,
     applyServerSideEncryptionByDefault: { sseAlgorithm: "AES256" },
   }],
 });
-
-new aws.s3.BucketPublicAccessBlock(`${prefix}-files-block`, {
-  bucket: bucket.id,
-  blockPublicAcls: true,
-  ignorePublicAcls: true,
-  blockPublicPolicy: true,
-  restrictPublicBuckets: true,
-});
 {{/if}}
 
 {{#unless hasDatabase}}{{#unless hasCache}}{{#unless hasStorage}}
-// No managed data stores configured.
 const _placeholder = pulumi.output(prefix);
 {{/unless}}{{/unless}}{{/unless}}

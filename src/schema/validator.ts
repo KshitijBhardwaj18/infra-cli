@@ -37,9 +37,7 @@ export function validateEnvConfig(raw: unknown): HeizenEnvConfig {
   }
   const c = raw as Record<string, any>;
   if (!c.awsProfile) throw new Error("heizen.env.yaml missing awsProfile");
-  if (!c.secrets) c.secrets = { generated: [], manual: [] };
-  if (!Array.isArray(c.secrets.generated)) c.secrets.generated = [];
-  if (!Array.isArray(c.secrets.manual)) c.secrets.manual = [];
+  if (!Array.isArray(c.secrets)) c.secrets = [];
   if (!c.env || typeof c.env !== "object") c.env = {};
   return c as HeizenEnvConfig;
 }
@@ -58,4 +56,12 @@ export function suggestEnvVar(secretName: string): string {
 
 export function isValidEnvVar(value: string): boolean {
   return /^[A-Z_][A-Z0-9_]*$/.test(value);
+}
+
+export function pulumiKeyFromEnvVar(envVar: string): string {
+  return envVar
+    .toLowerCase()
+    .split("_")
+    .map((part, i) => i === 0 ? part : part[0].toUpperCase() + part.slice(1))
+    .join("");
 }

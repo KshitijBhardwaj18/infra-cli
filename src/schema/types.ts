@@ -48,6 +48,7 @@ export interface HeizenConfig {
     engine: "postgres" | "none";
     size: DbSize;
     deletionProtection: boolean;
+    dbName?: string;
   };
   cache: {
     engine: "redis" | "none";
@@ -58,20 +59,17 @@ export interface HeizenConfig {
   };
 }
 
-export type SecretKind = "generated" | "manual";
-
 export interface SecretSpec {
   name: string;
   envVar: string;
   services: string[];
+  generate?: boolean;
+  value?: string;
 }
 
 export interface HeizenEnvConfig {
   awsProfile: string;
-  secrets: {
-    generated: SecretSpec[];
-    manual: SecretSpec[];
-  };
+  secrets: SecretSpec[];
   env: {
     shared?: Record<string, string>;
     [serviceName: string]: Record<string, string> | undefined;

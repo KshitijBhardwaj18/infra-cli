@@ -2,10 +2,23 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import { prefix, region, rootDomain, ecrImage{{#each servicesWithDomain}}, {{camel name}}Domain{{/each}} } from "../config";
 import { privateSubnet1, privateSubnet2, ecsSg } from "./networking";
-{{#if hasDatabase}}import { db, dbPassword } from "./store";
-{{/if}}{{#if hasCache}}import { redis } from "./store";
-{{/if}}{{#if hasStorage}}import { bucket } from "./store";
-{{/if}}{{#if hasAlb}}
+{{#if hasAnySecrets}}
+import {
+{{#if hasDatabase}}  db,
+{{/if}}{{#if hasCache}}  redis,
+{{/if}}{{#if hasStorage}}  bucket,
+{{/if}}{{#each allSecretConfigs}}  {{configVar}},
+{{/each}}
+} from "./store";
+{{else}}
+import {
+{{#if hasDatabase}}  db,
+{{/if}}{{#if hasCache}}  redis,
+{{/if}}{{#if hasStorage}}  bucket,
+{{/if}}
+} from "./store";
+{{/if}}
+{{#if hasAlb}}
 import {
 {{#each servicesWithDomain}}
   {{targetGroupVar}},
@@ -13,10 +26,6 @@ import {
 {{/if}}{{/each}}
 } from "./loadbalancer";
 {{/if}}
-
-{{#each allSecrets}}
-const {{varName}} = aws.secretsmanager.getSecretOutput({ name: "{{secretName}}" });
-{{/each}}
 
 const ecsAssumeRole = JSON.stringify({
   Version: "2012-10-17",
@@ -54,18 +63,6 @@ new aws.iam.RolePolicy(`${prefix}-ecr-cross-account`, {
   }),
 });
 
-new aws.iam.RolePolicy(`${prefix}-secrets-read`, {
-  role: executionRole.name,
-  policy: pulumi.interpolate`{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue"],
-      "Resource": "arn:aws:secretsmanager:${region}:*:secret:${prefix}/*"
-    }]
-  }`,
-});
-
 {{#if hasStorage}}
 const s3Policy = pulumi.interpolate`{
   "Version": "2012-10-17",
@@ -92,26 +89,22 @@ const ssmPolicy = JSON.stringify({
 });
 
 {{#each services}}
-{{#unless isFrontend}}
 const {{camel name}}TaskRole = new aws.iam.Role(`${prefix}-{{name}}-task-role`, {
   name: `${prefix}-{{name}}-task-role`,
   assumeRolePolicy: ecsAssumeRole,
 });
 
-{{#if @root.hasStorage}}
 {{#if envFromBucket}}
 new aws.iam.RolePolicy(`${prefix}-{{name}}-s3-policy`, {
   role: {{camel name}}TaskRole.name,
   policy: s3Policy,
 });
 {{/if}}
-{{/if}}
 
 new aws.iam.RolePolicy(`${prefix}-{{name}}-ssm-policy`, {
   role: {{camel name}}TaskRole.name,
   policy: ssmPolicy,
 });
-{{/unless}}
 
 new aws.cloudwatch.LogGroup(`${prefix}-{{name}}-logs`, {
   name: `/ecs/${prefix}/{{name}}`,
@@ -126,42 +119,21 @@ export const cluster = new aws.ecs.Cluster(`${prefix}-cluster`, {
 });
 
 {{#each services}}
-const {{camel name}}Environment = pulumi
-  .all([
-{{#if envFromDb}}    db.endpoint,
-    dbPassword,
-{{/if}}{{#if envFromRedis}}    redis.cacheNodes.apply(nodes => nodes[0].address),
-    redis.cacheNodes.apply(nodes => nodes[0].port.toString()),
-{{/if}}{{#if envFromBucket}}    bucket.bucket,
-{{/if}}  ])
-  .apply((vals) => {
-    let i = 0;
-{{#if envFromDb}}    const dbEndpoint = vals[i++] as string;
-    const dbPass = vals[i++] as string;
-{{/if}}{{#if envFromRedis}}    const rHost = vals[i++] as string;
-    const rPort = vals[i++] as string;
-{{/if}}{{#if envFromBucket}}    const bucketName = vals[i++] as string;
-{{/if}}    const out: Array<{ name: string; value: string }> = [];
-{{#if envFromNodeEnv}}    out.push({ name: "NODE_ENV", value: "production" });
-{{/if}}{{#if envFromDb}}    out.push({ name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/{{@root.database.dbName}}` });
-{{/if}}{{#if envFromRedis}}    out.push({ name: "REDIS_URL", value: `redis://${rHost}:${rPort}` });
-{{/if}}{{#if envFromBucket}}    out.push({ name: "AWS_S3_BUCKET", value: bucketName });
-{{/if}}{{#if envFromRegion}}    out.push({ name: "AWS_S3_REGION", value: region });
-{{/if}}{{#each envLiteral}}    out.push({ name: "{{name}}", value: {{jsonString value}} });
-{{/each}}{{#if isFrontend}}    out.push({ name: "PORT", value: "{{port}}" });
-    out.push({ name: "NEXT_PUBLIC_APP_DOMAIN", value: rootDomain });
-{{/if}}    return out;
-  });
-
-const {{camel name}}Secrets = pulumi
-  .all([
-{{#each secrets}}    {{varName}}.arn,
-{{/each}}  ])
-  .apply((arns) => {
-    const out: Array<{ name: string; valueFrom: string }> = [];
-{{#each secrets}}    out.push({ name: "{{envVar}}", valueFrom: arns[{{@index}}] as string });
-{{/each}}    return out;
-  });
+const {{camel name}}Environment = pulumi.all([
+{{#each pulumiAllSources}}  {{this}},
+{{/each}}]).apply(([{{join pulumiDestructure ", "}}]) => {
+  const out: Array<{ name: string; value: string }> = [];
+{{#if envFromNodeEnv}}  out.push({ name: "NODE_ENV", value: "production" });
+{{/if}}{{#if envFromDb}}  out.push({ name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/{{@root.database.dbName}}` });
+{{/if}}{{#if envFromRedis}}  out.push({ name: "REDIS_URL", value: `redis://${rHost}:${rPort}` });
+{{/if}}{{#if envFromBucket}}  out.push({ name: "AWS_S3_BUCKET", value: `${bucketName}` });
+{{/if}}{{#if envFromRegion}}  out.push({ name: "AWS_S3_REGION", value: region });
+{{/if}}{{#each secretConfigVars}}  out.push({ name: "{{envVar}}", value: `${ {{~configVar}}Val }` });
+{{/each}}{{#each envLiteral}}  out.push({ name: "{{name}}", value: {{jsonString value}} });
+{{/each}}{{#if isFrontend}}  out.push({ name: "PORT", value: "{{port}}" });
+  out.push({ name: "NEXT_PUBLIC_APP_DOMAIN", value: rootDomain });
+{{/if}}  return out;
+});
 
 const {{camel name}}TaskDef = new aws.ecs.TaskDefinition(`${prefix}-{{name}}-task`, {
   family: `${prefix}-{{name}}`,
@@ -170,10 +142,9 @@ const {{camel name}}TaskDef = new aws.ecs.TaskDefinition(`${prefix}-{{name}}-tas
   cpu: "{{cpuValue}}",
   memory: "{{memoryValue}}",
   executionRoleArn: executionRole.arn,
-  taskRoleArn: {{#if isFrontend}}executionRole.arn{{else}}{{camel name}}TaskRole.arn{{/if}},
-  containerDefinitions: pulumi
-    .all([{{camel name}}Environment, {{camel name}}Secrets])
-    .apply(([envArr, secretsArr]) => JSON.stringify([{
+  taskRoleArn: {{camel name}}TaskRole.arn,
+  containerDefinitions: {{camel name}}Environment.apply((env) =>
+    JSON.stringify([{
       name: "{{name}}",
       image: ecrImage,
       essential: true,
@@ -183,8 +154,7 @@ const {{camel name}}TaskDef = new aws.ecs.TaskDefinition(`${prefix}-{{name}}-tas
         { containerPort: {{port}}, protocol: "tcp" },
 {{#if wildcard}}        { containerPort: {{wildcardPort}}, protocol: "tcp" },
 {{/if}}      ],
-{{/if}}      environment: envArr,
-      secrets: secretsArr,
+{{/if}}      environment: env,
       logConfiguration: {
         logDriver: "awslogs",
         options: {
@@ -193,7 +163,8 @@ const {{camel name}}TaskDef = new aws.ecs.TaskDefinition(`${prefix}-{{name}}-tas
           "awslogs-stream-prefix": "{{name}}",
         },
       },
-    }])),
+    }]),
+  ),
 });
 
 export const {{camel name}}Service = new aws.ecs.Service(`${prefix}-{{name}}-service`, {
@@ -214,7 +185,7 @@ export const {{camel name}}Service = new aws.ecs.Service(`${prefix}-{{name}}-ser
 {{/if}}  ],
 {{/if}}  deploymentCircuitBreaker: { enable: {{@root.ecsDefaults.circuitBreaker}}, rollback: {{@root.ecsDefaults.circuitBreaker}} },
   tags: { Name: `${prefix}-{{name}}` },
-});
+}{{#if @root.hasDatabase}}{{#if @root.hasCache}}, { dependsOn: [db, redis] }{{else}}, { dependsOn: [db] }{{/if}}{{else}}{{#if @root.hasCache}}, { dependsOn: [redis] }{{/if}}{{/if}});
 
 {{#if scalable}}
 const {{camel name}}ScalingTarget = new aws.appautoscaling.Target(`${prefix}-{{name}}-scaling`, {

@@ -1,43 +1,15 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
-import * as crypto from "crypto";
 import { prefix } from "../config";
 import { privateSubnet1, privateSubnet2 } from "./networking";
 import { rdsSg, redisSg } from "./networking";
 
-// ---- Secrets ----
+const config = new pulumi.Config();
 
-const dbPasswordSecret = new aws.secretsmanager.Secret(`${prefix}-db-password`, {
-  name: `${prefix}/db-password`,
-});
-
-export const dbPasswordValue = new aws.secretsmanager.SecretVersion(`${prefix}-db-password-value`, {
-  secretId: dbPasswordSecret.id,
-  secretString: pulumi.secret(crypto.randomBytes(24).toString("hex")),
-});
-
-const authSecretSecret = new aws.secretsmanager.Secret(`${prefix}-auth-secret`, {
-  name: `${prefix}/better-auth-secret`,
-});
-
-export const authSecretValue = new aws.secretsmanager.SecretVersion(`${prefix}-auth-secret-value`, {
-  secretId: authSecretSecret.id,
-  secretString: pulumi.secret(crypto.randomBytes(32).toString("hex")),
-});
-
-const smtpSecretSecret = new aws.secretsmanager.Secret(`${prefix}-smtp-credentials`, {
-  name: `${prefix}/smtp-credentials`,
-});
-
-export const smtpSecretValue = new aws.secretsmanager.SecretVersion(`${prefix}-smtp-credentials-value`, {
-  secretId: smtpSecretSecret.id,
-  secretString: pulumi.secret(JSON.stringify({
-    user: "AKIAYMDL27SSCCTTXV73",
-    password: "BNs2wxckJndT7scWBNa0Qy83/RaycsIlmxHjLAFCPKik",
-  })),
-});
-
-// ---- Database (RDS PostgreSQL) ----
+export const dbPassword = config.requireSecret("dbPassword");
+export const authSecret = config.requireSecret("authSecret");
+export const smtpUser = config.requireSecret("smtpUser");
+export const smtpPassword = config.requireSecret("smtpPassword");
 
 const dbSubnetGroup = new aws.rds.SubnetGroup(`${prefix}-db-subnet`, {
   subnetIds: [privateSubnet1.id, privateSubnet2.id],
@@ -53,7 +25,7 @@ export const db = new aws.rds.Instance(`${prefix}-db`, {
   storageType: "gp3",
   dbName: "workforce",
   username: "postgres",
-  password: dbPasswordValue.secretString.apply(s => s || ""),
+  password: dbPassword,
   dbSubnetGroupName: dbSubnetGroup.name,
   vpcSecurityGroupIds: [rdsSg.id],
   publiclyAccessible: false,
@@ -63,9 +35,7 @@ export const db = new aws.rds.Instance(`${prefix}-db`, {
   skipFinalSnapshot: false,
   finalSnapshotIdentifier: `${prefix}-db-final-snapshot`,
   tags: { Name: `${prefix}-db` },
-});
-
-// ---- Redis (ElastiCache) ----
+}, { ignoreChanges: ["password"] });
 
 const redisSubnetGroup = new aws.elasticache.SubnetGroup(`${prefix}-redis-subnet`, {
   subnetIds: [privateSubnet1.id, privateSubnet2.id],
@@ -82,8 +52,6 @@ export const redis = new aws.elasticache.Cluster(`${prefix}-redis`, {
   securityGroupIds: [redisSg.id],
   tags: { Name: `${prefix}-redis` },
 });
-
-// ---- S3 Bucket ----
 
 export const bucket = new aws.s3.Bucket(`${prefix}-files`, {
   bucket: `${prefix}-files-961381384955`,

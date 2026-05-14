@@ -9,11 +9,20 @@ import {
   CPU_PRESETS, DB_PRESETS, CACHE_PRESETS,
   NETWORKING_DEFAULTS, DATABASE_DEFAULTS, CACHE_DEFAULTS, ECS_DEFAULTS,
 } from "../schema/presets.js";
+import { pulumiKeyFromEnvVar } from "../schema/validator.js";
 import { success } from "../ui.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
 registerHelpers();
+
+interface EnvEntry {
+  name: string;
+  fromConfig: boolean;
+  configVar?: string;
+  literal?: string;
+  pulumiExpr?: string;
+}
 
 interface ServiceCtx extends ServiceConfig {
   cpuValue: string;
@@ -27,14 +36,15 @@ interface ServiceCtx extends ServiceConfig {
   isWorker: boolean;
   receivesBackendEnv: boolean;
   scalable: boolean;
-  environment: Array<{ name: string; value: string | { ref: "dbUrl" | "redisUrl" | "bucket" | "region" | "nodeEnv" } }>;
-  envLiteral: Array<{ name: string; value: string }>;
   envFromDb: boolean;
   envFromRedis: boolean;
   envFromBucket: boolean;
   envFromRegion: boolean;
   envFromNodeEnv: boolean;
-  secrets: Array<{ envVar: string; secretName: string; varName: string }>;
+  envLiteral: Array<{ name: string; value: string }>;
+  secretConfigVars: Array<{ envVar: string; configVar: string }>;
+  pulumiAllSources: string[];
+  pulumiDestructure: string[];
 }
 
 interface TemplateContext {
@@ -78,8 +88,7 @@ interface TemplateContext {
     deletionProtection: boolean;
     encrypted: boolean;
     dbName: string;
-    dbPasswordSecretVar: string;
-    dbPasswordSecretName: string;
+    dbPasswordConfigVar: string;
   };
 
   cache?: {
@@ -87,7 +96,7 @@ interface TemplateContext {
     engineVersion: string;
   };
 
-  allSecrets: Array<{ envVar: string; secretName: string; varName: string }>;
+  allSecretConfigs: Array<{ envVar: string; configVar: string }>;
   hasAnySecrets: boolean;
 
   services: ServiceCtx[];
@@ -141,20 +150,14 @@ function buildTemplateContext(cfg: HeizenConfig, envCfg: HeizenEnvConfig): Templ
   const hasDatabase = cfg.database.engine === "postgres";
   const hasCache = cfg.cache.engine === "redis";
   const hasStorage = cfg.storage.enabled;
+  const dbName = cfg.database.dbName ?? cfg.project.replace(/-/g, "_");
 
-  const allSecretSpecs: Array<{ spec: SecretSpec; kind: "generated" | "manual" }> = [
-    ...envCfg.secrets.generated.map((spec) => ({ spec, kind: "generated" as const })),
-    ...envCfg.secrets.manual.map((spec) => ({ spec, kind: "manual" as const })),
-  ];
+  const dbPasswordSpec = envCfg.secrets.find((s) => s.envVar === "DATABASE_PASSWORD") ?? envCfg.secrets.find((s) => s.name === "db-password");
+  const dbPasswordConfigVar = dbPasswordSpec ? pulumiKeyFromEnvVar(dbPasswordSpec.envVar) : "dbPassword";
 
-  const dbPasswordSpec = envCfg.secrets.generated.find((s) => s.name === "db-password");
-  const dbPasswordSecretName = dbPasswordSpec ? `${prefix}/${dbPasswordSpec.name}` : `${prefix}/db-password`;
-  const dbPasswordSecretVar = "dbPasswordSecret";
-
-  const allSecrets = allSecretSpecs.map(({ spec }) => ({
-    envVar: spec.envVar,
-    secretName: `${prefix}/${spec.name}`,
-    varName: secretVarName(spec.name),
+  const allSecretConfigs = envCfg.secrets.map((s) => ({
+    envVar: s.envVar,
+    configVar: pulumiKeyFromEnvVar(s.envVar),
   }));
 
   const services: ServiceCtx[] = cfg.services.map((s) => {
@@ -179,22 +182,24 @@ function buildTemplateContext(cfg: HeizenConfig, envCfg: HeizenEnvConfig): Templ
       isWorker,
       receivesBackendEnv,
       scalable: s.scaling.max > s.scaling.min,
-      environment: [],
-      envLiteral: [],
       envFromDb: false,
       envFromRedis: false,
       envFromBucket: false,
       envFromRegion: false,
       envFromNodeEnv: false,
-      secrets: [],
+      envLiteral: [],
+      secretConfigVars: [],
+      pulumiAllSources: [],
+      pulumiDestructure: [],
     };
   });
 
   const byName = new Map(services.map((s) => [s.name, s]));
 
   for (const svc of services) {
-    populateServiceEnv(svc, cfg, envCfg, hasDatabase, hasCache, hasStorage, byName);
-    populateServiceSecrets(svc, envCfg, prefix, byName);
+    populateServiceEnv(svc, envCfg, hasDatabase, hasCache, hasStorage, byName);
+    populateServiceSecrets(svc, envCfg, byName);
+    buildPulumiAllSources(svc, dbPasswordConfigVar);
   }
 
   const servicesWithDomain = services.filter((s) => s.hasDomain);
@@ -266,9 +271,8 @@ function buildTemplateContext(cfg: HeizenConfig, envCfg: HeizenEnvConfig): Templ
       backupRetentionPeriod: DATABASE_DEFAULTS.backupRetentionPeriod,
       deletionProtection: cfg.database.deletionProtection,
       encrypted: DATABASE_DEFAULTS.encrypted,
-      dbName: cfg.project.replace(/-/g, "_"),
-      dbPasswordSecretVar,
-      dbPasswordSecretName,
+      dbName,
+      dbPasswordConfigVar,
     } : undefined,
 
     cache: hasCache ? {
@@ -276,8 +280,8 @@ function buildTemplateContext(cfg: HeizenConfig, envCfg: HeizenEnvConfig): Templ
       engineVersion: CACHE_DEFAULTS.engineVersion,
     } : undefined,
 
-    allSecrets,
-    hasAnySecrets: allSecrets.length > 0,
+    allSecretConfigs,
+    hasAnySecrets: allSecretConfigs.length > 0,
 
     services,
     servicesWithDomain,
@@ -290,7 +294,6 @@ function buildTemplateContext(cfg: HeizenConfig, envCfg: HeizenEnvConfig): Templ
 
 function populateServiceEnv(
   svc: ServiceCtx,
-  cfg: HeizenConfig,
   envCfg: HeizenEnvConfig,
   hasDatabase: boolean,
   hasCache: boolean,
@@ -333,18 +336,15 @@ function populateServiceEnv(
 function populateServiceSecrets(
   svc: ServiceCtx,
   envCfg: HeizenEnvConfig,
-  prefix: string,
   byName: Map<string, ServiceCtx>,
 ): void {
-  const collected = new Map<string, { envVar: string; secretName: string; varName: string }>();
-  const all = [...envCfg.secrets.generated, ...envCfg.secrets.manual];
+  const collected = new Map<string, { envVar: string; configVar: string }>();
 
-  for (const spec of all) {
+  for (const spec of envCfg.secrets) {
     if (spec.services.includes(svc.name)) {
       collected.set(spec.envVar, {
         envVar: spec.envVar,
-        secretName: `${prefix}/${spec.name}`,
-        varName: secretVarName(spec.name),
+        configVar: pulumiKeyFromEnvVar(spec.envVar),
       });
     }
   }
@@ -352,17 +352,41 @@ function populateServiceSecrets(
   if (svc.inheritEnvFrom) {
     const parent = byName.get(svc.inheritEnvFrom);
     if (parent) {
-      for (const s of parent.secrets) {
+      for (const s of parent.secretConfigVars) {
         if (!collected.has(s.envVar)) collected.set(s.envVar, s);
       }
     }
   }
 
-  svc.secrets = Array.from(collected.values());
+  svc.secretConfigVars = Array.from(collected.values());
 }
 
-function secretVarName(secretName: string): string {
-  return camelize(secretName) + "Secret";
+function buildPulumiAllSources(svc: ServiceCtx, dbPasswordConfigVar: string): void {
+  const sources: string[] = [];
+  const destructure: string[] = [];
+
+  if (svc.envFromDb) {
+    sources.push("db.endpoint");
+    destructure.push("dbEndpoint");
+    sources.push(dbPasswordConfigVar);
+    destructure.push("dbPass");
+  }
+  if (svc.envFromRedis) {
+    sources.push("redis.cacheNodes.apply((nodes: any) => nodes[0].address)");
+    destructure.push("rHost");
+    sources.push("redis.cacheNodes.apply((nodes: any) => nodes[0].port.toString())");
+    destructure.push("rPort");
+  }
+  if (svc.envFromBucket) {
+    sources.push("bucket.bucket");
+    destructure.push("bucketName");
+  }
+  for (const sec of svc.secretConfigVars) {
+    sources.push(sec.configVar);
+    destructure.push(`${sec.configVar}Val`);
+  }
+  svc.pulumiAllSources = sources;
+  svc.pulumiDestructure = destructure;
 }
 
 function renderTemplate(name: string, ctx: TemplateContext): string {
@@ -385,9 +409,7 @@ function registerHelpers(): void {
   Handlebars.registerHelper("eq", (a: unknown, b: unknown) => a === b);
   Handlebars.registerHelper("priority", (index: number) => (index + 1) * 100);
   Handlebars.registerHelper("jsonString", (v: unknown) => JSON.stringify(v));
-  Handlebars.registerHelper("dbUrl", function (this: any) {
-    return "`postgresql://postgres:${dbPass}@${dbEndpoint}/" + this.database.dbName + "`";
-  });
+  Handlebars.registerHelper("join", (arr: unknown, sep: string) => Array.isArray(arr) ? arr.join(sep) : "");
 }
 
 function camelize(s: string): string {

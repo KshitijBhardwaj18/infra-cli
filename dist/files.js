@@ -4,7 +4,13 @@ import yaml from "js-yaml";
 export const CONFIG_FILE = "heizen.yaml";
 export const ENV_CONFIG_FILE = "heizen.env.yaml";
 export const SECRETS_FILE = ".heizen.secrets";
-const GITIGNORE_ENTRIES = [ENV_CONFIG_FILE, SECRETS_FILE, "infra/node_modules", "infra/bin"];
+const GITIGNORE_ENTRIES = [
+    ENV_CONFIG_FILE,
+    SECRETS_FILE,
+    "infra/node_modules",
+    "infra/bin",
+    "infra/Pulumi.*.yaml",
+];
 export function configPath(cwd = process.cwd()) {
     return resolve(cwd, CONFIG_FILE);
 }

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import Handlebars from "handlebars";
 import ora from "ora";
 import { CPU_PRESETS, DB_PRESETS, CACHE_PRESETS, NETWORKING_DEFAULTS, DATABASE_DEFAULTS, CACHE_DEFAULTS, ECS_DEFAULTS, } from "../schema/presets.js";
+import { pulumiKeyFromEnvVar } from "../schema/validator.js";
 import { success } from "../ui.js";
 const here = dirname(fileURLToPath(import.meta.url));
 registerHelpers();
@@ -40,17 +41,12 @@ function buildTemplateContext(cfg, envCfg) {
     const hasDatabase = cfg.database.engine === "postgres";
     const hasCache = cfg.cache.engine === "redis";
     const hasStorage = cfg.storage.enabled;
-    const allSecretSpecs = [
-        ...envCfg.secrets.generated.map((spec) => ({ spec, kind: "generated" })),
-        ...envCfg.secrets.manual.map((spec) => ({ spec, kind: "manual" })),
-    ];
-    const dbPasswordSpec = envCfg.secrets.generated.find((s) => s.name === "db-password");
-    const dbPasswordSecretName = dbPasswordSpec ? `${prefix}/${dbPasswordSpec.name}` : `${prefix}/db-password`;
-    const dbPasswordSecretVar = "dbPasswordSecret";
-    const allSecrets = allSecretSpecs.map(({ spec }) => ({
-        envVar: spec.envVar,
-        secretName: `${prefix}/${spec.name}`,
-        varName: secretVarName(spec.name),
+    const dbName = cfg.database.dbName ?? cfg.project.replace(/-/g, "_");
+    const dbPasswordSpec = envCfg.secrets.find((s) => s.envVar === "DATABASE_PASSWORD") ?? envCfg.secrets.find((s) => s.name === "db-password");
+    const dbPasswordConfigVar = dbPasswordSpec ? pulumiKeyFromEnvVar(dbPasswordSpec.envVar) : "dbPassword";
+    const allSecretConfigs = envCfg.secrets.map((s) => ({
+        envVar: s.envVar,
+        configVar: pulumiKeyFromEnvVar(s.envVar),
     }));
     const services = cfg.services.map((s) => {
         const preset = CPU_PRESETS[s.cpu];
@@ -74,20 +70,22 @@ function buildTemplateContext(cfg, envCfg) {
             isWorker,
             receivesBackendEnv,
             scalable: s.scaling.max > s.scaling.min,
-            environment: [],
-            envLiteral: [],
             envFromDb: false,
             envFromRedis: false,
             envFromBucket: false,
             envFromRegion: false,
             envFromNodeEnv: false,
-            secrets: [],
+            envLiteral: [],
+            secretConfigVars: [],
+            pulumiAllSources: [],
+            pulumiDestructure: [],
         };
     });
     const byName = new Map(services.map((s) => [s.name, s]));
     for (const svc of services) {
-        populateServiceEnv(svc, cfg, envCfg, hasDatabase, hasCache, hasStorage, byName);
-        populateServiceSecrets(svc, envCfg, prefix, byName);
+        populateServiceEnv(svc, envCfg, hasDatabase, hasCache, hasStorage, byName);
+        populateServiceSecrets(svc, envCfg, byName);
+        buildPulumiAllSources(svc, dbPasswordConfigVar);
     }
     const servicesWithDomain = services.filter((s) => s.hasDomain);
     const servicesWithDomainSorted = [...servicesWithDomain].sort((a, b) => {
@@ -153,16 +151,15 @@ function buildTemplateContext(cfg, envCfg) {
             backupRetentionPeriod: DATABASE_DEFAULTS.backupRetentionPeriod,
             deletionProtection: cfg.database.deletionProtection,
             encrypted: DATABASE_DEFAULTS.encrypted,
-            dbName: cfg.project.replace(/-/g, "_"),
-            dbPasswordSecretVar,
-            dbPasswordSecretName,
+            dbName,
+            dbPasswordConfigVar,
         } : undefined,
         cache: hasCache ? {
             nodeType: CACHE_PRESETS[cfg.cache.size].nodeType,
             engineVersion: CACHE_DEFAULTS.engineVersion,
         } : undefined,
-        allSecrets,
-        hasAnySecrets: allSecrets.length > 0,
+        allSecretConfigs,
+        hasAnySecrets: allSecretConfigs.length > 0,
         services,
         servicesWithDomain,
         servicesWithDomainSorted,
@@ -171,7 +168,7 @@ function buildTemplateContext(cfg, envCfg) {
         wildcardRules,
     };
 }
-function populateServiceEnv(svc, cfg, envCfg, hasDatabase, hasCache, hasStorage, byName) {
+function populateServiceEnv(svc, envCfg, hasDatabase, hasCache, hasStorage, byName) {
     const literals = {};
     if (svc.receivesBackendEnv) {
         svc.envFromNodeEnv = true;
@@ -204,31 +201,52 @@ function populateServiceEnv(svc, cfg, envCfg, hasDatabase, hasCache, hasStorage,
         Object.assign(literals, own);
     svc.envLiteral = Object.entries(literals).map(([name, value]) => ({ name, value }));
 }
-function populateServiceSecrets(svc, envCfg, prefix, byName) {
+function populateServiceSecrets(svc, envCfg, byName) {
     const collected = new Map();
-    const all = [...envCfg.secrets.generated, ...envCfg.secrets.manual];
-    for (const spec of all) {
+    for (const spec of envCfg.secrets) {
         if (spec.services.includes(svc.name)) {
             collected.set(spec.envVar, {
                 envVar: spec.envVar,
-                secretName: `${prefix}/${spec.name}`,
-                varName: secretVarName(spec.name),
+                configVar: pulumiKeyFromEnvVar(spec.envVar),
             });
         }
     }
     if (svc.inheritEnvFrom) {
         const parent = byName.get(svc.inheritEnvFrom);
         if (parent) {
-            for (const s of parent.secrets) {
+            for (const s of parent.secretConfigVars) {
                 if (!collected.has(s.envVar))
                     collected.set(s.envVar, s);
             }
         }
     }
-    svc.secrets = Array.from(collected.values());
+    svc.secretConfigVars = Array.from(collected.values());
 }
-function secretVarName(secretName) {
-    return camelize(secretName) + "Secret";
+function buildPulumiAllSources(svc, dbPasswordConfigVar) {
+    const sources = [];
+    const destructure = [];
+    if (svc.envFromDb) {
+        sources.push("db.endpoint");
+        destructure.push("dbEndpoint");
+        sources.push(dbPasswordConfigVar);
+        destructure.push("dbPass");
+    }
+    if (svc.envFromRedis) {
+        sources.push("redis.cacheNodes.apply((nodes: any) => nodes[0].address)");
+        destructure.push("rHost");
+        sources.push("redis.cacheNodes.apply((nodes: any) => nodes[0].port.toString())");
+        destructure.push("rPort");
+    }
+    if (svc.envFromBucket) {
+        sources.push("bucket.bucket");
+        destructure.push("bucketName");
+    }
+    for (const sec of svc.secretConfigVars) {
+        sources.push(sec.configVar);
+        destructure.push(`${sec.configVar}Val`);
+    }
+    svc.pulumiAllSources = sources;
+    svc.pulumiDestructure = destructure;
 }
 function renderTemplate(name, ctx) {
     const candidates = [
@@ -253,9 +271,7 @@ function registerHelpers() {
     Handlebars.registerHelper("eq", (a, b) => a === b);
     Handlebars.registerHelper("priority", (index) => (index + 1) * 100);
     Handlebars.registerHelper("jsonString", (v) => JSON.stringify(v));
-    Handlebars.registerHelper("dbUrl", function () {
-        return "`postgresql://postgres:${dbPass}@${dbEndpoint}/" + this.database.dbName + "`";
-    });
+    Handlebars.registerHelper("join", (arr, sep) => Array.isArray(arr) ? arr.join(sep) : "");
 }
 function camelize(s) {
     return s.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase());

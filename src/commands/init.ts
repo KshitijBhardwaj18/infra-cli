@@ -1,6 +1,5 @@
 import { input, select, confirm, password, checkbox } from "@inquirer/prompts";
 import chalk from "chalk";
-import { existsSync } from "node:fs";
 
 import {
   CPU_PRESETS, DB_PRESETS, CACHE_PRESETS, NAT_PRESETS,
@@ -12,13 +11,16 @@ import type {
   NatMode, ServiceType, SecretSpec,
 } from "../schema/types.js";
 import { isKebabCase, isValidDomain, isValidEnvVar, suggestEnvVar } from "../schema/validator.js";
-import { section, box, success, info, warn, dim, header, nextSteps, padRight, failure } from "../ui.js";
+import { section, box, success, info, dim, header, nextSteps, padRight, failure } from "../ui.js";
 import { writeConfig, writeEnvConfig, readConfig, ensureGitignore } from "../files.js";
 import { runGenerate } from "./generate.js";
+import { checkPrerequisites } from "../prereqs.js";
 
 export async function runInit(opts: { envOnly?: boolean } = {}): Promise<void> {
   console.log();
   console.log(chalk.bold.cyan("Heizen Infra Init"));
+
+  await checkPrerequisites();
 
   if (opts.envOnly) {
     const cfg = readConfig();
@@ -45,7 +47,7 @@ export async function runInit(opts: { envOnly?: boolean } = {}): Promise<void> {
   const project = await promptProject();
   const networking = await promptNetworking(project.region);
   const services = await promptServices();
-  const data = await promptDataStores();
+  const data = await promptDataStores(project.project);
 
   const cfg: HeizenConfig = {
     version: 1,
@@ -82,7 +84,7 @@ export async function runInit(opts: { envOnly?: boolean } = {}): Promise<void> {
   success(".gitignore updated");
 
   if (!proceed) {
-    info("Config saved. Run 'heizen infra generate' when you're ready.");
+    info("Config saved. Run 'heizen infra generate' when ready.");
     return;
   }
 
@@ -109,7 +111,7 @@ async function promptProject(): Promise<ProjectAnswers> {
   console.log();
 
   const project = await input({
-    message: "Project name (kebab-case, e.g., workforce):",
+    message: "Project name (kebab-case, e.g., my-project):",
     validate: (v) => isKebabCase(v) || "Must be kebab-case (lowercase, numbers, dashes).",
   });
   const env = await input({ message: "Environment:", default: "prod" });
@@ -119,11 +121,11 @@ async function promptProject(): Promise<ProjectAnswers> {
     default: "us-east-1",
   });
   const domain = await input({
-    message: "Root domain (e.g., stafflogic.com):",
+    message: "Root domain (e.g., myapp.com):",
     validate: (v) => isValidDomain(v) || "Enter a valid domain like example.com.",
   });
   const ecrImage = await input({
-    message: "ECR image URI (e.g., 123456.dkr.ecr.us-east-1.amazonaws.com/myapp):",
+    message: `ECR image URI (e.g., 123456789.dkr.ecr.${region}.amazonaws.com/${project}):`,
     validate: (v) => v.includes("dkr.ecr.") || "Provide a full ECR repository URI.",
   });
   const ecrTag = await input({ message: "ECR image tag:", default: "latest" });
@@ -222,7 +224,7 @@ async function promptServices(): Promise<ServiceConfig[]> {
     if (type === "backend") {
       const port = Number(await input({ message: "Port:", default: "3001" }));
       const domain = await input({
-        message: "Domain (e.g., api.stafflogic.com):",
+        message: "Domain (e.g., api.myapp.com):",
         validate: (v) => isValidDomain(v) || "Enter a valid domain.",
       });
       const cpu = (await select({ message: "CPU:", choices: cpuChoices })) as CpuSize;
@@ -242,11 +244,11 @@ async function promptServices(): Promise<ServiceConfig[]> {
     } else if (type === "frontend") {
       const port = Number(await input({ message: "Port:", default: "3000" }));
       const domain = await input({
-        message: "Domain (e.g., admin.stafflogic.com):",
+        message: "Domain (e.g., app.myapp.com):",
         validate: (v) => isValidDomain(v) || "Enter a valid domain.",
       });
       const wildcard = await confirm({
-        message: "Wildcard subdomains? (e.g., acme.stafflogic.com)",
+        message: "Wildcard subdomains? (e.g., tenant.myapp.com)",
         default: false,
       });
       let wildcardPort: number | undefined;
@@ -337,7 +339,7 @@ interface DataStoreAnswers {
   storage: HeizenConfig["storage"];
 }
 
-async function promptDataStores(): Promise<DataStoreAnswers> {
+async function promptDataStores(projectName: string): Promise<DataStoreAnswers> {
   section("Data Stores");
 
   const dbEngine = await select({
@@ -351,6 +353,7 @@ async function promptDataStores(): Promise<DataStoreAnswers> {
 
   let dbSize: DbSize = "small";
   let dbDeletionProtection = DATABASE_DEFAULTS.deletionProtection;
+  let dbName = projectName.replace(/-/g, "_");
 
   if (dbEngine === "postgres") {
     dbSize = (await select({
@@ -378,6 +381,11 @@ async function promptDataStores(): Promise<DataStoreAnswers> {
       dbDeletionProtection = await confirm({
         message: "Enable deletion protection?",
         default: DATABASE_DEFAULTS.deletionProtection,
+      });
+      dbName = await input({
+        message: "Database name:",
+        default: dbName,
+        validate: (v) => /^[a-z_][a-z0-9_]*$/.test(v) || "Use lowercase, numbers, underscores.",
       });
     }
   }
@@ -420,6 +428,7 @@ async function promptDataStores(): Promise<DataStoreAnswers> {
       engine: dbEngine as "postgres" | "none",
       size: dbSize,
       deletionProtection: dbDeletionProtection,
+      dbName: dbEngine === "postgres" ? dbName : undefined,
     },
     cache: {
       engine: cacheEngine as "redis" | "none",
@@ -436,11 +445,11 @@ async function promptAwsProfile(): Promise<string> {
   return await input({ message: "AWS profile:", default: "default" });
 }
 
-async function promptSecrets(services: ServiceConfig[]): Promise<HeizenEnvConfig["secrets"]> {
+async function promptSecrets(services: ServiceConfig[]): Promise<SecretSpec[]> {
   section("Secrets");
-  dim("Secrets are stored in AWS Secrets Manager.");
-  dim("Values are never stored in config files or git.");
-  dim("Secret values are prompted during first deploy only.");
+  dim("Secrets are stored in Pulumi encrypted config (per stack, never plaintext).");
+  dim("Auto-generated secrets get random values on first deploy.");
+  dim("Manual secrets can have a value here (file is gitignored) or be prompted during deploy.");
   console.log();
 
   const serviceChoices = services.map((s) => ({
@@ -449,69 +458,49 @@ async function promptSecrets(services: ServiceConfig[]): Promise<HeizenEnvConfig
     checked: s.type === "backend" || s.type === "worker",
   }));
 
-  console.log(chalk.bold("Auto-generated secrets (CLI creates random values):"));
-  const generated: SecretSpec[] = [
-    {
+  const secrets: SecretSpec[] = [];
+
+  const dbServices = services.filter((s) => s.type === "backend" || s.type === "worker").map((s) => s.name);
+  if (dbServices.length > 0) {
+    secrets.push({
       name: "db-password",
       envVar: "DATABASE_PASSWORD",
-      services: services.filter((s) => s.type === "backend" || s.type === "worker").map((s) => s.name),
-    },
-    {
-      name: "better-auth-secret",
-      envVar: "BETTER_AUTH_SECRET",
-      services: services.filter((s) => s.type === "backend" || s.type === "worker").map((s) => s.name),
-    },
-  ];
-  for (const g of generated) {
-    console.log(`  • ${g.name} → ${g.envVar} (services: ${g.services.join(", ") || "—"})`);
+      services: dbServices,
+      generate: true,
+    });
+    secrets.push({
+      name: "auth-secret",
+      envVar: "AUTH_SECRET",
+      services: dbServices,
+      generate: true,
+    });
+    console.log(chalk.bold("Pre-seeded generated secrets:"));
+    for (const s of secrets) {
+      console.log(`  • ${s.name} → ${s.envVar} → [${s.services.join(", ")}] ${chalk.dim("(generated)")}`);
+    }
+    console.log();
   }
-  console.log();
 
   while (true) {
     const more = await confirm({
-      message: generated.length > 2 ? "Add another generated secret?" : "Add a generated secret?",
+      message: secrets.length > 0 ? "Add another secret?" : "Add a secret?",
       default: false,
     });
     if (!more) break;
 
-    const name = await input({
-      message: "Secret name (kebab-case, e.g., jwt-secret):",
-      validate: (v) => {
-        if (!isKebabCase(v)) return "Must be kebab-case.";
-        if (generated.some((s) => s.name === v)) return "Already added.";
-        return true;
-      },
+    const kind = await select({
+      message: "Secret kind:",
+      choices: [
+        { name: "generated — CLI creates a random value on first deploy", value: "generated" },
+        { name: "manual    — you provide the value (now or during deploy)", value: "manual" },
+      ],
     });
-    const envVar = await input({
-      message: "Env var name:",
-      default: suggestEnvVar(name),
-      validate: (v) => isValidEnvVar(v) || "Must be UPPER_SNAKE_CASE.",
-    });
-    const selected = (await checkbox({
-      message: "Which services need this?",
-      choices: serviceChoices,
-    })) as string[];
-    generated.push({ name, envVar, services: selected });
-  }
-
-  console.log();
-  console.log(chalk.bold("Manual secrets (you provide values during first deploy):"));
-  const manual: SecretSpec[] = [];
-  let isFirst = true;
-  while (true) {
-    const more = await confirm({
-      message: isFirst ? "Add a manual secret?" : "Add another manual secret?",
-      default: isFirst,
-    });
-    isFirst = false;
-    if (!more) break;
 
     const name = await input({
       message: "Secret name (kebab-case, e.g., stripe-secret-key):",
       validate: (v) => {
         if (!isKebabCase(v)) return "Must be kebab-case.";
-        if (manual.some((s) => s.name === v)) return "Already added.";
-        if (generated.some((s) => s.name === v)) return "Already used by a generated secret.";
+        if (secrets.some((s) => s.name === v)) return "Already added.";
         return true;
       },
     });
@@ -524,10 +513,29 @@ async function promptSecrets(services: ServiceConfig[]): Promise<HeizenEnvConfig
       message: "Which services need this?",
       choices: serviceChoices,
     })) as string[];
-    manual.push({ name, envVar, services: selected });
+
+    if (kind === "generated") {
+      secrets.push({ name, envVar, services: selected, generate: true });
+    } else {
+      const provideNow = await confirm({
+        message: "Provide the value now? (stored in gitignored heizen.env.yaml)",
+        default: false,
+      });
+      let value: string | undefined;
+      if (provideNow) {
+        value = await password({
+          message: `Value for ${envVar}:`,
+          mask: "*",
+          validate: (v) => v.length > 0 || "A value is required.",
+        });
+      }
+      const spec: SecretSpec = { name, envVar, services: selected };
+      if (value) spec.value = value;
+      secrets.push(spec);
+    }
   }
 
-  return { generated, manual };
+  return secrets;
 }
 
 async function promptEnvVars(cfg: HeizenConfig): Promise<HeizenEnvConfig["env"]> {
@@ -635,15 +643,13 @@ function printSummary(cfg: HeizenConfig, envCfg: HeizenEnvConfig): void {
     const p = CACHE_PRESETS[cfg.cache.size];
     console.log(`    Redis ${CACHE_DEFAULTS.engineVersion} (${p.nodeType}) ~ $${p.monthlyCost}/mo`);
   }
-  if (cfg.storage.enabled) console.log("    S3 bucket (versioning, AES-256, public access blocked)");
+  if (cfg.storage.enabled) console.log("    S3 bucket (versioning, AES-256, private)");
   console.log();
 
   header("  Secrets:");
-  for (const s of envCfg.secrets.generated) {
-    console.log(`    ${chalk.dim("(generated)")} ${s.name} → ${s.envVar} → [${s.services.join(", ")}]`);
-  }
-  for (const s of envCfg.secrets.manual) {
-    console.log(`    ${chalk.dim("(manual)   ")} ${s.name} → ${s.envVar} → [${s.services.join(", ")}]`);
+  for (const s of envCfg.secrets) {
+    const kind = s.generate ? chalk.dim("(generated)") : (s.value ? chalk.dim("(value set) ") : chalk.dim("(manual)   "));
+    console.log(`    ${kind} ${s.name} → ${s.envVar} → [${s.services.join(", ")}]`);
   }
   console.log();
 
@@ -673,7 +679,7 @@ function printSummary(cfg: HeizenConfig, envCfg: HeizenEnvConfig): void {
     lines.push(`ElastiCache Redis (${cfg.cache.size})      $${cost.toFixed(2)}`);
   }
   total += STORAGE_OVERHEAD_MONTHLY;
-  lines.push(`S3 + CloudWatch + Secrets Manager $${STORAGE_OVERHEAD_MONTHLY.toFixed(2)}`);
+  lines.push(`S3 + CloudWatch                  $${STORAGE_OVERHEAD_MONTHLY.toFixed(2)}`);
   lines.push("---");
   lines.push(`Total                            $${total.toFixed(2)}/mo`);
 

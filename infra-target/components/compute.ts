@@ -2,10 +2,8 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import { prefix, region, rootDomain, adminDomain, apiDomain, ecrImage } from "../config";
 import { privateSubnet1, privateSubnet2, ecsSg } from "./networking";
-import { db, redis, bucket, dbPasswordValue, authSecretValue, smtpSecretValue } from "./store";
+import { db, redis, bucket, dbPassword, authSecret, smtpUser, smtpPassword } from "./store";
 import { apiTg, adminTg, orgTg } from "./loadbalancer";
-
-// ---- IAM Roles ----
 
 const ecsAssumeRole = JSON.stringify({
   Version: "2012-10-17",
@@ -96,7 +94,15 @@ new aws.iam.RolePolicy(`${prefix}-worker-ssm-policy`, {
   policy: ssmPolicy,
 });
 
-// ---- CloudWatch Log Groups ----
+const frontendsTaskRole = new aws.iam.Role(`${prefix}-frontends-task-role`, {
+  name: `${prefix}-frontends-task-role`,
+  assumeRolePolicy: ecsAssumeRole,
+});
+
+new aws.iam.RolePolicy(`${prefix}-frontends-ssm-policy`, {
+  role: frontendsTaskRole.name,
+  policy: ssmPolicy,
+});
 
 new aws.cloudwatch.LogGroup(`${prefix}-api-logs`, {
   name: `/ecs/${prefix}/api`,
@@ -113,57 +119,56 @@ new aws.cloudwatch.LogGroup(`${prefix}-worker-logs`, {
   retentionInDays: 90,
 });
 
-// ---- ECS Cluster ----
-
 export const cluster = new aws.ecs.Cluster(`${prefix}-cluster`, {
   name: `${prefix}-cluster`,
   settings: [{ name: "containerInsights", value: "enabled" }],
   tags: { Name: `${prefix}-cluster` },
 });
 
-// ---- Shared Environment Variables ----
+const redisEndpoint = redis.cacheNodes.apply((nodes: any) => nodes[0].address);
+const redisPort = redis.cacheNodes.apply((nodes: any) => nodes[0].port.toString());
 
-const redisEndpoint = redis.cacheNodes.apply(nodes => nodes[0].address);
-const redisPort = redis.cacheNodes.apply(nodes => nodes[0].port.toString());
+const apiEnvironment = pulumi.all([
+  db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket, authSecret, smtpUser, smtpPassword,
+]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName, authSec, smtpU, smtpP]) => [
+  { name: "NODE_ENV", value: "production" },
+  { name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/workforce` },
+  { name: "REDIS_URL", value: `redis://${rHost}:${rPort}` },
+  { name: "BETTER_AUTH_SECRET", value: `${authSec}` },
+  { name: "BETTER_AUTH_URL", value: `https://${apiDomain}` },
+  { name: "BETTER_AUTH_DOMAIN", value: `.${rootDomain}` },
+  { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
+  { name: "ORG_PORTAL_BASE_URL", value: `https://${rootDomain}` },
+  { name: "API_URL", value: `https://${apiDomain}` },
+  { name: "CORS_URLS", value: `https://${adminDomain},https://*.${rootDomain}` },
+  { name: "AWS_S3_REGION", value: region },
+  { name: "AWS_S3_BUCKET", value: `${bucketName}` },
+  { name: "SMTP_HOST", value: "email-smtp.us-east-1.amazonaws.com" },
+  { name: "SMTP_PORT", value: "465" },
+  { name: "SMTP_USER", value: `${smtpU}` },
+  { name: "SMTP_PASSWORD", value: `${smtpP}` },
+  { name: "SMTP_FROM", value: `noreply@${rootDomain}` },
+  { name: "SMTP_FROM_NAME", value: "StaffLogic" },
+]);
 
-const sharedEnv = pulumi.all([
-  db.endpoint, dbPasswordValue.secretString,
-  redisEndpoint, redisPort,
-  authSecretValue.secretString,
-  smtpSecretValue.secretString,
-  bucket.bucket,
-]).apply(([dbEndpoint, dbPass, rHost, rPort, authSec, smtpCreds, bucketName]) => {
-  const smtp = JSON.parse(smtpCreds || "{}");
-  return [
-    { name: "NODE_ENV", value: "production" },
-    { name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/workforce` },
-    { name: "REDIS_URL", value: `redis://${rHost}:${rPort}` },
-    { name: "BETTER_AUTH_SECRET", value: authSec },
-    { name: "BETTER_AUTH_URL", value: `https://${apiDomain}` },
-    { name: "BETTER_AUTH_DOMAIN", value: `.${rootDomain}` },
-    { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
-    { name: "ORG_PORTAL_BASE_URL", value: `https://${rootDomain}` },
-    { name: "API_URL", value: `https://${apiDomain}` },
-    { name: "CORS_URLS", value: `https://${adminDomain},https://*.${rootDomain}` },
-    { name: "AWS_S3_REGION", value: region },
-    { name: "AWS_S3_BUCKET", value: bucketName },
-    { name: "AWS_S3_ACCESS_KEY_ID", value: "" },
-    { name: "AWS_S3_SECRET_ACCESS_KEY", value: "" },
-    { name: "SMTP_HOST", value: "email-smtp.us-east-1.amazonaws.com" },
-    { name: "SMTP_PORT", value: "465" },
-    { name: "SMTP_USER", value: smtp.user },
-    { name: "SMTP_PASSWORD", value: smtp.password },
-    { name: "SMTP_FROM", value: `noreply@${rootDomain}` },
-    { name: "SMTP_FROM_NAME", value: "StaffLogic" },
-    { name: "RESERVED_SLUGS", value: "" },
-    { name: "HEIZEN_API_KEY", value: "placeholder" },
-    { name: "HEIZEN_ENDPOINT", value: "http://localhost:5080" },
-    { name: "HEIZEN_PROJECT_ID", value: "workforce" },
-    { name: "HEIZEN_PROJECT_NAME", value: "Workforce" },
-  ];
-});
-
-// ---- Task Definitions ----
+const workerEnvironment = pulumi.all([
+  db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket, authSecret, smtpUser, smtpPassword,
+]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName, authSec, smtpU, smtpP]) => [
+  { name: "NODE_ENV", value: "production" },
+  { name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/workforce` },
+  { name: "REDIS_URL", value: `redis://${rHost}:${rPort}` },
+  { name: "BETTER_AUTH_SECRET", value: `${authSec}` },
+  { name: "AWS_S3_REGION", value: region },
+  { name: "AWS_S3_BUCKET", value: `${bucketName}` },
+  { name: "SMTP_HOST", value: "email-smtp.us-east-1.amazonaws.com" },
+  { name: "SMTP_PORT", value: "465" },
+  { name: "SMTP_USER", value: `${smtpU}` },
+  { name: "SMTP_PASSWORD", value: `${smtpP}` },
+  { name: "SMTP_FROM", value: `noreply@${rootDomain}` },
+  { name: "SMTP_FROM_NAME", value: "StaffLogic" },
+  { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
+  { name: "ORG_PORTAL_BASE_URL", value: `https://${rootDomain}` },
+]);
 
 const apiTaskDef = new aws.ecs.TaskDefinition(`${prefix}-api-task`, {
   family: `${prefix}-api`,
@@ -173,22 +178,24 @@ const apiTaskDef = new aws.ecs.TaskDefinition(`${prefix}-api-task`, {
   memory: "1024",
   executionRoleArn: executionRole.arn,
   taskRoleArn: apiTaskRole.arn,
-  containerDefinitions: sharedEnv.apply(env => JSON.stringify([{
-    name: "api",
-    image: ecrImage,
-    essential: true,
-    command: ["sh", "-c", "npm run db:deploy && node apps/server/dist/src/main.js"],
-    portMappings: [{ containerPort: 3001, protocol: "tcp" }],
-    environment: env,
-    logConfiguration: {
-      logDriver: "awslogs",
-      options: {
-        "awslogs-group": `/ecs/${prefix}/api`,
-        "awslogs-region": region,
-        "awslogs-stream-prefix": "api",
+  containerDefinitions: apiEnvironment.apply(env =>
+    JSON.stringify([{
+      name: "api",
+      image: ecrImage,
+      essential: true,
+      command: ["sh", "-c", "npm run db:deploy && node apps/server/dist/src/main.js"],
+      portMappings: [{ containerPort: 3001, protocol: "tcp" }],
+      environment: env,
+      logConfiguration: {
+        logDriver: "awslogs",
+        options: {
+          "awslogs-group": `/ecs/${prefix}/api`,
+          "awslogs-region": region,
+          "awslogs-stream-prefix": "api",
+        },
       },
-    },
-  }])),
+    }]),
+  ),
 });
 
 const frontendsTaskDef = new aws.ecs.TaskDefinition(`${prefix}-frontends-task`, {
@@ -198,7 +205,7 @@ const frontendsTaskDef = new aws.ecs.TaskDefinition(`${prefix}-frontends-task`, 
   cpu: "256",
   memory: "1024",
   executionRoleArn: executionRole.arn,
-  taskRoleArn: executionRole.arn,
+  taskRoleArn: frontendsTaskRole.arn,
   containerDefinitions: pulumi.output(JSON.stringify([{
     name: "frontends",
     image: ecrImage,
@@ -237,28 +244,24 @@ const workerTaskDef = new aws.ecs.TaskDefinition(`${prefix}-worker-task`, {
   memory: "512",
   executionRoleArn: executionRole.arn,
   taskRoleArn: workerTaskRole.arn,
-  containerDefinitions: sharedEnv.apply(env => JSON.stringify([{
-    name: "worker",
-    image: ecrImage,
-    essential: true,
-    command: ["sh", "-c", "bun run apps/worker/src/main.ts"],
-    environment: [
-      ...env,
-      { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
-      { name: "ORG_PORTAL_BASE_URL", value: `https://${rootDomain}` },
-    ],
-    logConfiguration: {
-      logDriver: "awslogs",
-      options: {
-        "awslogs-group": `/ecs/${prefix}/worker`,
-        "awslogs-region": region,
-        "awslogs-stream-prefix": "worker",
+  containerDefinitions: workerEnvironment.apply(env =>
+    JSON.stringify([{
+      name: "worker",
+      image: ecrImage,
+      essential: true,
+      command: ["sh", "-c", "bun run apps/worker/src/main.ts"],
+      environment: env,
+      logConfiguration: {
+        logDriver: "awslogs",
+        options: {
+          "awslogs-group": `/ecs/${prefix}/worker`,
+          "awslogs-region": region,
+          "awslogs-stream-prefix": "worker",
+        },
       },
-    },
-  }])),
+    }]),
+  ),
 });
-
-// ---- Services ----
 
 export const apiService = new aws.ecs.Service(`${prefix}-api-service`, {
   name: `${prefix}-api`,
@@ -267,6 +270,7 @@ export const apiService = new aws.ecs.Service(`${prefix}-api-service`, {
   desiredCount: 2,
   launchType: "FARGATE",
   enableExecuteCommand: true,
+  healthCheckGracePeriodSeconds: 120,
   networkConfiguration: {
     subnets: [privateSubnet1.id, privateSubnet2.id],
     securityGroups: [ecsSg.id],
@@ -279,7 +283,7 @@ export const apiService = new aws.ecs.Service(`${prefix}-api-service`, {
   }],
   deploymentCircuitBreaker: { enable: true, rollback: true },
   tags: { Name: `${prefix}-api` },
-});
+}, { dependsOn: [db, redis] });
 
 export const frontendsService = new aws.ecs.Service(`${prefix}-frontends-service`, {
   name: `${prefix}-frontends`,
@@ -288,6 +292,7 @@ export const frontendsService = new aws.ecs.Service(`${prefix}-frontends-service
   desiredCount: 1,
   launchType: "FARGATE",
   enableExecuteCommand: true,
+  healthCheckGracePeriodSeconds: 60,
   networkConfiguration: {
     subnets: [privateSubnet1.id, privateSubnet2.id],
     securityGroups: [ecsSg.id],
@@ -315,9 +320,7 @@ export const workerService = new aws.ecs.Service(`${prefix}-worker-service`, {
   },
   deploymentCircuitBreaker: { enable: true, rollback: true },
   tags: { Name: `${prefix}-worker` },
-});
-
-// ---- Auto-scaling ----
+}, { dependsOn: [db, redis] });
 
 const apiScalingTarget = new aws.appautoscaling.Target(`${prefix}-api-scaling`, {
   maxCapacity: 10,
