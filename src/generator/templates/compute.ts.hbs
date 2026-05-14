@@ -174,7 +174,8 @@ export const {{camel name}}Service = new aws.ecs.Service(`${prefix}-{{name}}-ser
   desiredCount: {{scaling.min}},
   launchType: "FARGATE",
   enableExecuteCommand: {{@root.ecsDefaults.ecsExec}},
-  networkConfiguration: {
+{{#if hasDomain}}  healthCheckGracePeriodSeconds: 120,
+{{/if}}  networkConfiguration: {
     subnets: [privateSubnet1.id, privateSubnet2.id],
     securityGroups: [ecsSg.id],
     assignPublicIp: false,

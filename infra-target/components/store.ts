@@ -7,9 +7,6 @@ import { rdsSg, redisSg } from "./networking";
 const config = new pulumi.Config();
 
 export const dbPassword = config.requireSecret("dbPassword");
-export const authSecret = config.requireSecret("authSecret");
-export const smtpUser = config.requireSecret("smtpUser");
-export const smtpPassword = config.requireSecret("smtpPassword");
 
 const dbSubnetGroup = new aws.rds.SubnetGroup(`${prefix}-db-subnet`, {
   subnetIds: [privateSubnet1.id, privateSubnet2.id],

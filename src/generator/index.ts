@@ -341,6 +341,7 @@ function populateServiceSecrets(
   const collected = new Map<string, { envVar: string; configVar: string }>();
 
   for (const spec of envCfg.secrets) {
+    if (spec.name === "db-password") continue;
     if (spec.services.includes(svc.name)) {
       collected.set(spec.envVar, {
         envVar: spec.envVar,

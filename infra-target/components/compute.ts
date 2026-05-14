@@ -2,7 +2,7 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import { prefix, region, rootDomain, adminDomain, apiDomain, ecrImage } from "../config";
 import { privateSubnet1, privateSubnet2, ecsSg } from "./networking";
-import { db, redis, bucket, dbPassword, authSecret, smtpUser, smtpPassword } from "./store";
+import { db, redis, bucket, dbPassword } from "./store";
 import { apiTg, adminTg, orgTg } from "./loadbalancer";
 
 const ecsAssumeRole = JSON.stringify({
@@ -129,12 +129,11 @@ const redisEndpoint = redis.cacheNodes.apply((nodes: any) => nodes[0].address);
 const redisPort = redis.cacheNodes.apply((nodes: any) => nodes[0].port.toString());
 
 const apiEnvironment = pulumi.all([
-  db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket, authSecret, smtpUser, smtpPassword,
-]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName, authSec, smtpU, smtpP]) => [
+  db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket,
+]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName]) => [
   { name: "NODE_ENV", value: "production" },
   { name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/workforce` },
   { name: "REDIS_URL", value: `redis://${rHost}:${rPort}` },
-  { name: "BETTER_AUTH_SECRET", value: `${authSec}` },
   { name: "BETTER_AUTH_URL", value: `https://${apiDomain}` },
   { name: "BETTER_AUTH_DOMAIN", value: `.${rootDomain}` },
   { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
@@ -143,29 +142,16 @@ const apiEnvironment = pulumi.all([
   { name: "CORS_URLS", value: `https://${adminDomain},https://*.${rootDomain}` },
   { name: "AWS_S3_REGION", value: region },
   { name: "AWS_S3_BUCKET", value: `${bucketName}` },
-  { name: "SMTP_HOST", value: "email-smtp.us-east-1.amazonaws.com" },
-  { name: "SMTP_PORT", value: "465" },
-  { name: "SMTP_USER", value: `${smtpU}` },
-  { name: "SMTP_PASSWORD", value: `${smtpP}` },
-  { name: "SMTP_FROM", value: `noreply@${rootDomain}` },
-  { name: "SMTP_FROM_NAME", value: "StaffLogic" },
 ]);
 
 const workerEnvironment = pulumi.all([
-  db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket, authSecret, smtpUser, smtpPassword,
-]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName, authSec, smtpU, smtpP]) => [
+  db.endpoint, dbPassword, redisEndpoint, redisPort, bucket.bucket,
+]).apply(([dbEndpoint, dbPass, rHost, rPort, bucketName]) => [
   { name: "NODE_ENV", value: "production" },
   { name: "DATABASE_URL", value: `postgresql://postgres:${dbPass}@${dbEndpoint}/workforce` },
   { name: "REDIS_URL", value: `redis://${rHost}:${rPort}` },
-  { name: "BETTER_AUTH_SECRET", value: `${authSec}` },
   { name: "AWS_S3_REGION", value: region },
   { name: "AWS_S3_BUCKET", value: `${bucketName}` },
-  { name: "SMTP_HOST", value: "email-smtp.us-east-1.amazonaws.com" },
-  { name: "SMTP_PORT", value: "465" },
-  { name: "SMTP_USER", value: `${smtpU}` },
-  { name: "SMTP_PASSWORD", value: `${smtpP}` },
-  { name: "SMTP_FROM", value: `noreply@${rootDomain}` },
-  { name: "SMTP_FROM_NAME", value: "StaffLogic" },
   { name: "ADMIN_FRONTEND_URL", value: `https://${adminDomain}` },
   { name: "ORG_PORTAL_BASE_URL", value: `https://${rootDomain}` },
 ]);

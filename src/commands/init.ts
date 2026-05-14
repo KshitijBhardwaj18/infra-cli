@@ -460,24 +460,18 @@ async function promptSecrets(services: ServiceConfig[]): Promise<SecretSpec[]> {
 
   const secrets: SecretSpec[] = [];
 
-  const dbServices = services.filter((s) => s.type === "backend" || s.type === "worker").map((s) => s.name);
-  if (dbServices.length > 0) {
+  const hasDbConsumers = services.some((s) => s.type === "backend" || s.type === "worker");
+  if (hasDbConsumers) {
     secrets.push({
       name: "db-password",
       envVar: "DATABASE_PASSWORD",
-      services: dbServices,
+      services: [],
       generate: true,
     });
-    secrets.push({
-      name: "auth-secret",
-      envVar: "AUTH_SECRET",
-      services: dbServices,
-      generate: true,
-    });
-    console.log(chalk.bold("Pre-seeded generated secrets:"));
-    for (const s of secrets) {
-      console.log(`  • ${s.name} → ${s.envVar} → [${s.services.join(", ")}] ${chalk.dim("(generated)")}`);
-    }
+    console.log(chalk.bold("Infrastructure secrets (auto-managed):"));
+    box([
+      `DB_PASSWORD    auto-generated, wired to DATABASE_URL`,
+    ]);
     console.log();
   }
 
