@@ -7,12 +7,12 @@ import { CPU_PRESETS, DB_PRESETS, CACHE_PRESETS, NETWORKING_DEFAULTS, DATABASE_D
 import { success } from "../ui.js";
 const here = dirname(fileURLToPath(import.meta.url));
 registerHelpers();
-export async function generateInfra(cfg, cwd) {
-    const spinner = ora("Generating infrastructure code...").start();
+export async function generateInfra(cfg, envCfg, cwd) {
+    const spinner = ora("Rendering templates...").start();
     const infraDir = resolve(cwd, "infra");
     const componentsDir = join(infraDir, "components");
     mkdirSync(componentsDir, { recursive: true });
-    const ctx = buildTemplateContext(cfg);
+    const ctx = buildTemplateContext(cfg, envCfg);
     const files = [
         ["pulumi-yaml", join(infraDir, "Pulumi.yaml")],
         ["pulumi-stack-yaml", join(infraDir, `Pulumi.${cfg.env}.yaml`)],
@@ -35,12 +35,23 @@ export async function generateInfra(cfg, cwd) {
         success(`Generated: ${rel}`);
     }
 }
-function buildTemplateContext(cfg) {
+function buildTemplateContext(cfg, envCfg) {
     const prefix = `${cfg.project}-${cfg.env}`;
     const hasDatabase = cfg.database.engine === "postgres";
     const hasCache = cfg.cache.engine === "redis";
     const hasStorage = cfg.storage.enabled;
-    const hasSmtp = !!cfg.smtp;
+    const allSecretSpecs = [
+        ...envCfg.secrets.generated.map((spec) => ({ spec, kind: "generated" })),
+        ...envCfg.secrets.manual.map((spec) => ({ spec, kind: "manual" })),
+    ];
+    const dbPasswordSpec = envCfg.secrets.generated.find((s) => s.name === "db-password");
+    const dbPasswordSecretName = dbPasswordSpec ? `${prefix}/${dbPasswordSpec.name}` : `${prefix}/db-password`;
+    const dbPasswordSecretVar = "dbPasswordSecret";
+    const allSecrets = allSecretSpecs.map(({ spec }) => ({
+        envVar: spec.envVar,
+        secretName: `${prefix}/${spec.name}`,
+        varName: secretVarName(spec.name),
+    }));
     const services = cfg.services.map((s) => {
         const preset = CPU_PRESETS[s.cpu];
         const isBackend = s.type === "backend";
@@ -49,6 +60,7 @@ function buildTemplateContext(cfg) {
         const hasDomain = !!s.domain;
         const tgVar = hasDomain ? `${camelize(s.name)}Tg` : undefined;
         const wildcardTgVar = (isFrontend && s.wildcard) ? `${camelize(s.name)}WildcardTg` : undefined;
+        const receivesBackendEnv = isBackend || isWorker;
         return {
             ...s,
             cpuValue: preset.cpu,
@@ -60,10 +72,23 @@ function buildTemplateContext(cfg) {
             isBackend,
             isFrontend,
             isWorker,
-            needsTaskRole: isBackend || isWorker,
+            receivesBackendEnv,
             scalable: s.scaling.max > s.scaling.min,
+            environment: [],
+            envLiteral: [],
+            envFromDb: false,
+            envFromRedis: false,
+            envFromBucket: false,
+            envFromRegion: false,
+            envFromNodeEnv: false,
+            secrets: [],
         };
     });
+    const byName = new Map(services.map((s) => [s.name, s]));
+    for (const svc of services) {
+        populateServiceEnv(svc, cfg, envCfg, hasDatabase, hasCache, hasStorage, byName);
+        populateServiceSecrets(svc, envCfg, prefix, byName);
+    }
     const servicesWithDomain = services.filter((s) => s.hasDomain);
     const servicesWithDomainSorted = [...servicesWithDomain].sort((a, b) => {
         if (a.wildcard && !b.wildcard)
@@ -117,7 +142,6 @@ function buildTemplateContext(cfg) {
         hasDatabase,
         hasCache,
         hasStorage,
-        hasSmtp,
         hasAlb,
         needsRdsSg: hasDatabase,
         needsRedisSg: hasCache,
@@ -130,26 +154,81 @@ function buildTemplateContext(cfg) {
             deletionProtection: cfg.database.deletionProtection,
             encrypted: DATABASE_DEFAULTS.encrypted,
             dbName: cfg.project.replace(/-/g, "_"),
+            dbPasswordSecretVar,
+            dbPasswordSecretName,
         } : undefined,
         cache: hasCache ? {
             nodeType: CACHE_PRESETS[cfg.cache.size].nodeType,
             engineVersion: CACHE_DEFAULTS.engineVersion,
         } : undefined,
-        smtp: cfg.smtp,
+        allSecrets,
+        hasAnySecrets: allSecrets.length > 0,
         services,
         servicesWithDomain,
         servicesWithDomainSorted,
         defaultTargetGroupVar,
         ecsDefaults: ECS_DEFAULTS,
-        serviceDomainExports: services.map((s) => ({
-            name: s.name,
-            varName: `${camelize(s.name)}Service`,
-            constName: `${camelize(s.name)}ServiceName`,
-            domain: s.domain ?? "",
-        })),
-        containsBackendOrWorker: services.some((s) => s.isBackend || s.isWorker),
         wildcardRules,
     };
+}
+function populateServiceEnv(svc, cfg, envCfg, hasDatabase, hasCache, hasStorage, byName) {
+    const literals = {};
+    if (svc.receivesBackendEnv) {
+        svc.envFromNodeEnv = true;
+        if (hasDatabase)
+            svc.envFromDb = true;
+        if (hasCache)
+            svc.envFromRedis = true;
+        if (hasStorage) {
+            svc.envFromBucket = true;
+            svc.envFromRegion = true;
+        }
+        Object.assign(literals, envCfg.env.shared ?? {});
+    }
+    if (svc.inheritEnvFrom) {
+        const parent = byName.get(svc.inheritEnvFrom);
+        if (parent) {
+            svc.envFromNodeEnv = svc.envFromNodeEnv || parent.envFromNodeEnv;
+            svc.envFromDb = svc.envFromDb || parent.envFromDb;
+            svc.envFromRedis = svc.envFromRedis || parent.envFromRedis;
+            svc.envFromBucket = svc.envFromBucket || parent.envFromBucket;
+            svc.envFromRegion = svc.envFromRegion || parent.envFromRegion;
+            for (const lit of parent.envLiteral) {
+                if (!(lit.name in literals))
+                    literals[lit.name] = lit.value;
+            }
+        }
+    }
+    const own = envCfg.env[svc.name];
+    if (own)
+        Object.assign(literals, own);
+    svc.envLiteral = Object.entries(literals).map(([name, value]) => ({ name, value }));
+}
+function populateServiceSecrets(svc, envCfg, prefix, byName) {
+    const collected = new Map();
+    const all = [...envCfg.secrets.generated, ...envCfg.secrets.manual];
+    for (const spec of all) {
+        if (spec.services.includes(svc.name)) {
+            collected.set(spec.envVar, {
+                envVar: spec.envVar,
+                secretName: `${prefix}/${spec.name}`,
+                varName: secretVarName(spec.name),
+            });
+        }
+    }
+    if (svc.inheritEnvFrom) {
+        const parent = byName.get(svc.inheritEnvFrom);
+        if (parent) {
+            for (const s of parent.secrets) {
+                if (!collected.has(s.envVar))
+                    collected.set(s.envVar, s);
+            }
+        }
+    }
+    svc.secrets = Array.from(collected.values());
+}
+function secretVarName(secretName) {
+    return camelize(secretName) + "Secret";
 }
 function renderTemplate(name, ctx) {
     const candidates = [
@@ -163,9 +242,8 @@ function renderTemplate(name, ctx) {
             break;
         }
     }
-    if (!templatePath) {
+    if (!templatePath)
         throw new Error(`Template not found: ${name}.hbs`);
-    }
     const src = readFileSync(templatePath, "utf8");
     const tpl = Handlebars.compile(src, { noEscape: true });
     return tpl(ctx);
@@ -174,8 +252,10 @@ function registerHelpers() {
     Handlebars.registerHelper("camel", (s) => camelize(s));
     Handlebars.registerHelper("eq", (a, b) => a === b);
     Handlebars.registerHelper("priority", (index) => (index + 1) * 100);
-    Handlebars.registerHelper("upperConst", (s) => s.replace(/-/g, "_").toUpperCase());
     Handlebars.registerHelper("jsonString", (v) => JSON.stringify(v));
+    Handlebars.registerHelper("dbUrl", function () {
+        return "`postgresql://postgres:${dbPass}@${dbEndpoint}/" + this.database.dbName + "`";
+    });
 }
 function camelize(s) {
     return s.replace(/-([a-z0-9])/g, (_, c) => c.toUpperCase());

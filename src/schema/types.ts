@@ -22,7 +22,6 @@ export interface ServiceConfig {
     path: string;
     codes: string;
   };
-  env?: Record<string, string>;
   inheritEnvFrom?: string;
 }
 
@@ -31,31 +30,11 @@ export interface HeizenConfig {
   project: string;
   env: string;
   region: string;
-  awsProfile: string;
   domain: string;
-
   ecr: {
     image: string;
     tag: string;
   };
-
-  services: ServiceConfig[];
-
-  database: {
-    engine: "postgres" | "none";
-    size: DbSize;
-    deletionProtection: boolean;
-  };
-
-  cache: {
-    engine: "redis" | "none";
-    size: CacheSize;
-  };
-
-  storage: {
-    enabled: boolean;
-  };
-
   networking: {
     nat: NatMode;
     vpcCidr?: string;
@@ -64,11 +43,37 @@ export interface HeizenConfig {
     privateSubnet1Cidr?: string;
     privateSubnet2Cidr?: string;
   };
+  services: ServiceConfig[];
+  database: {
+    engine: "postgres" | "none";
+    size: DbSize;
+    deletionProtection: boolean;
+  };
+  cache: {
+    engine: "redis" | "none";
+    size: CacheSize;
+  };
+  storage: {
+    enabled: boolean;
+  };
+}
 
-  smtp?: {
-    host: string;
-    port: string;
-    from: string;
-    fromName: string;
+export type SecretKind = "generated" | "manual";
+
+export interface SecretSpec {
+  name: string;
+  envVar: string;
+  services: string[];
+}
+
+export interface HeizenEnvConfig {
+  awsProfile: string;
+  secrets: {
+    generated: SecretSpec[];
+    manual: SecretSpec[];
+  };
+  env: {
+    shared?: Record<string, string>;
+    [serviceName: string]: Record<string, string> | undefined;
   };
 }

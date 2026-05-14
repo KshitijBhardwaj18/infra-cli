@@ -3,7 +3,7 @@ export function validateConfig(raw) {
         throw new Error("heizen.yaml is empty or invalid");
     }
     const c = raw;
-    const required = ["project", "env", "region", "awsProfile", "domain", "ecr", "services", "database", "cache", "storage", "networking"];
+    const required = ["project", "env", "region", "domain", "ecr", "services", "database", "cache", "storage", "networking"];
     for (const key of required) {
         if (c[key] === undefined)
             throw new Error(`heizen.yaml missing required field: ${key}`);
@@ -24,10 +24,33 @@ export function validateConfig(raw) {
     }
     return c;
 }
+export function validateEnvConfig(raw) {
+    if (!raw || typeof raw !== "object") {
+        throw new Error("heizen.env.yaml is empty or invalid");
+    }
+    const c = raw;
+    if (!c.awsProfile)
+        throw new Error("heizen.env.yaml missing awsProfile");
+    if (!c.secrets)
+        c.secrets = { generated: [], manual: [] };
+    if (!Array.isArray(c.secrets.generated))
+        c.secrets.generated = [];
+    if (!Array.isArray(c.secrets.manual))
+        c.secrets.manual = [];
+    if (!c.env || typeof c.env !== "object")
+        c.env = {};
+    return c;
+}
 export function isKebabCase(value) {
     return /^[a-z][a-z0-9-]*[a-z0-9]$/.test(value);
 }
 export function isValidDomain(value) {
     return /^([a-z0-9-]+\.)+[a-z]{2,}$/i.test(value);
+}
+export function suggestEnvVar(secretName) {
+    return secretName.replace(/-/g, "_").toUpperCase();
+}
+export function isValidEnvVar(value) {
+    return /^[A-Z_][A-Z0-9_]*$/.test(value);
 }
 //# sourceMappingURL=validator.js.map

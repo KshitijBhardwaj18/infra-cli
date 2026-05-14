@@ -1,10 +1,6 @@
-import { input, select, confirm, password } from "@inquirer/prompts";
+import { input, select, confirm, password, checkbox } from "@inquirer/prompts";
 import chalk from "chalk";
-import yaml from "js-yaml";
-import { writeFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
-import { execa } from "execa";
-import ora from "ora";
+import { existsSync } from "node:fs";
 
 import {
   CPU_PRESETS, DB_PRESETS, CACHE_PRESETS, NAT_PRESETS,
@@ -12,45 +8,89 @@ import {
   ECS_DEFAULTS, REGIONS, ALB_MONTHLY_COST, STORAGE_OVERHEAD_MONTHLY,
 } from "../schema/presets.js";
 import type {
-  HeizenConfig, ServiceConfig, CpuSize, DbSize, CacheSize, NatMode, ServiceType,
+  HeizenConfig, HeizenEnvConfig, ServiceConfig, CpuSize, DbSize, CacheSize,
+  NatMode, ServiceType, SecretSpec,
 } from "../schema/types.js";
-import { isKebabCase, isValidDomain } from "../schema/validator.js";
-import { section, box, success, info, warn, dim, header, nextSteps, padRight } from "../ui.js";
-import { generateInfra } from "../generator/index.js";
+import { isKebabCase, isValidDomain, isValidEnvVar, suggestEnvVar } from "../schema/validator.js";
+import { section, box, success, info, warn, dim, header, nextSteps, padRight, failure } from "../ui.js";
+import { writeConfig, writeEnvConfig, readConfig, ensureGitignore } from "../files.js";
+import { runGenerate } from "./generate.js";
 
-export async function runInit(): Promise<void> {
+export async function runInit(opts: { envOnly?: boolean } = {}): Promise<void> {
   console.log();
   console.log(chalk.bold.cyan("Heizen Infra Init"));
+
+  if (opts.envOnly) {
+    const cfg = readConfig();
+    if (!cfg) {
+      failure("heizen.yaml not found. Run 'heizen infra init' without --env-only.");
+      process.exit(1);
+    }
+    dim("Configuring runtime (heizen.env.yaml) only. Infrastructure shape (heizen.yaml) untouched.");
+
+    const awsProfile = await promptAwsProfile();
+    const secrets = await promptSecrets(cfg.services);
+    const env = await promptEnvVars(cfg);
+
+    const envCfg: HeizenEnvConfig = { awsProfile, secrets, env };
+    writeEnvConfig(envCfg);
+    ensureGitignore();
+    success("Wrote heizen.env.yaml");
+    info("Next: Run 'heizen infra generate'");
+    return;
+  }
+
   dim("Generates Pulumi infrastructure for AWS ECS Fargate.");
 
   const project = await promptProject();
   const networking = await promptNetworking(project.region);
   const services = await promptServices();
   const data = await promptDataStores();
-  const smtp = await promptSecrets(project.project, project.env);
-  const config = buildConfig({ ...project, networking, services, ...data, smtp });
 
-  printSummary(config);
+  const cfg: HeizenConfig = {
+    version: 1,
+    project: project.project,
+    env: project.env,
+    region: project.region,
+    domain: project.domain,
+    ecr: project.ecr,
+    networking,
+    services,
+    database: data.database,
+    cache: data.cache,
+    storage: data.storage,
+  };
+
+  const awsProfile = await promptAwsProfile();
+  const secrets = await promptSecrets(services);
+  const env = await promptEnvVars(cfg);
+
+  const envCfg: HeizenEnvConfig = { awsProfile, secrets, env };
+
+  printSummary(cfg, envCfg);
 
   const proceed = await confirm({
     message: "Generate infrastructure code?",
     default: true,
   });
+
+  writeConfig(cfg);
+  writeEnvConfig(envCfg);
+  ensureGitignore();
+  success("Wrote heizen.yaml");
+  success("Wrote heizen.env.yaml (gitignored)");
+  success(".gitignore updated");
+
   if (!proceed) {
-    saveYaml(config);
-    info("heizen.yaml written. Run 'heizen infra init' again to regenerate.");
+    info("Config saved. Run 'heizen infra generate' when you're ready.");
     return;
   }
 
-  saveYaml(config);
-  await generateInfra(config, process.cwd());
-  await installDeps();
+  await runGenerate({ silent: false });
 
-  console.log();
-  success("Infrastructure code generated.");
   nextSteps([
     "Run 'heizen infra deploy' to provision infrastructure",
-    `Push a Docker image to ${config.ecr.image}:${config.ecr.tag}`,
+    `Push a Docker image to ${cfg.ecr.image}:${cfg.ecr.tag}`,
     "Add DNS records (shown after deploy)",
   ]);
 }
@@ -59,7 +99,6 @@ interface ProjectAnswers {
   project: string;
   env: string;
   region: string;
-  awsProfile: string;
   domain: string;
   ecr: { image: string; tag: string };
 }
@@ -79,7 +118,6 @@ async function promptProject(): Promise<ProjectAnswers> {
     choices: REGIONS.map((r) => ({ name: r, value: r })),
     default: "us-east-1",
   });
-  const awsProfile = await input({ message: "AWS profile:", default: "default" });
   const domain = await input({
     message: "Root domain (e.g., stafflogic.com):",
     validate: (v) => isValidDomain(v) || "Enter a valid domain like example.com.",
@@ -90,19 +128,10 @@ async function promptProject(): Promise<ProjectAnswers> {
   });
   const ecrTag = await input({ message: "ECR image tag:", default: "latest" });
 
-  return { project, env, region, awsProfile, domain, ecr: { image: ecrImage, tag: ecrTag } };
+  return { project, env, region, domain, ecr: { image: ecrImage, tag: ecrTag } };
 }
 
-interface NetworkingAnswers {
-  nat: NatMode;
-  vpcCidr: string;
-  publicSubnet1Cidr: string;
-  publicSubnet2Cidr: string;
-  privateSubnet1Cidr: string;
-  privateSubnet2Cidr: string;
-}
-
-async function promptNetworking(region: string): Promise<NetworkingAnswers> {
+async function promptNetworking(region: string): Promise<HeizenConfig["networking"]> {
   section("Networking");
 
   dim("Using standard networking defaults:");
@@ -111,11 +140,11 @@ async function promptNetworking(region: string): Promise<NetworkingAnswers> {
     `VPC:               ${NETWORKING_DEFAULTS.vpcCidr} (65,536 IPs)`,
     `Availability Zones: ${region}${NETWORKING_DEFAULTS.az1Suffix}, ${region}${NETWORKING_DEFAULTS.az2Suffix}`,
     "Public Subnets (ALB, NAT):",
-    `  ${region}${NETWORKING_DEFAULTS.az1Suffix}: ${NETWORKING_DEFAULTS.publicSubnet1Cidr} (256 IPs)`,
-    `  ${region}${NETWORKING_DEFAULTS.az2Suffix}: ${NETWORKING_DEFAULTS.publicSubnet2Cidr} (256 IPs)`,
+    `  ${region}${NETWORKING_DEFAULTS.az1Suffix}: ${NETWORKING_DEFAULTS.publicSubnet1Cidr}`,
+    `  ${region}${NETWORKING_DEFAULTS.az2Suffix}: ${NETWORKING_DEFAULTS.publicSubnet2Cidr}`,
     "Private Subnets (ECS, RDS, Redis):",
-    `  ${region}${NETWORKING_DEFAULTS.az1Suffix}: ${NETWORKING_DEFAULTS.privateSubnet1Cidr} (256 IPs)`,
-    `  ${region}${NETWORKING_DEFAULTS.az2Suffix}: ${NETWORKING_DEFAULTS.privateSubnet2Cidr} (256 IPs)`,
+    `  ${region}${NETWORKING_DEFAULTS.az1Suffix}: ${NETWORKING_DEFAULTS.privateSubnet1Cidr}`,
+    `  ${region}${NETWORKING_DEFAULTS.az2Suffix}: ${NETWORKING_DEFAULTS.privateSubnet2Cidr}`,
     "---",
     "Security Groups:",
     "  ALB:   ports 80, 443 from internet",
@@ -135,23 +164,16 @@ async function promptNetworking(region: string): Promise<NetworkingAnswers> {
   })) as NatMode;
 
   const customize = await confirm({ message: "Customize networking?", default: false });
-
-  let vpcCidr = NETWORKING_DEFAULTS.vpcCidr;
-  let publicSubnet1Cidr = NETWORKING_DEFAULTS.publicSubnet1Cidr;
-  let publicSubnet2Cidr = NETWORKING_DEFAULTS.publicSubnet2Cidr;
-  let privateSubnet1Cidr = NETWORKING_DEFAULTS.privateSubnet1Cidr;
-  let privateSubnet2Cidr = NETWORKING_DEFAULTS.privateSubnet2Cidr;
-
+  const out: HeizenConfig["networking"] = { nat };
   if (customize) {
     dim("Override any CIDR. Press enter to keep the default.");
-    vpcCidr = await input({ message: "VPC CIDR:", default: vpcCidr });
-    publicSubnet1Cidr = await input({ message: "Public subnet 1 CIDR:", default: publicSubnet1Cidr });
-    publicSubnet2Cidr = await input({ message: "Public subnet 2 CIDR:", default: publicSubnet2Cidr });
-    privateSubnet1Cidr = await input({ message: "Private subnet 1 CIDR:", default: privateSubnet1Cidr });
-    privateSubnet2Cidr = await input({ message: "Private subnet 2 CIDR:", default: privateSubnet2Cidr });
+    out.vpcCidr = await input({ message: "VPC CIDR:", default: NETWORKING_DEFAULTS.vpcCidr });
+    out.publicSubnet1Cidr = await input({ message: "Public subnet 1 CIDR:", default: NETWORKING_DEFAULTS.publicSubnet1Cidr });
+    out.publicSubnet2Cidr = await input({ message: "Public subnet 2 CIDR:", default: NETWORKING_DEFAULTS.publicSubnet2Cidr });
+    out.privateSubnet1Cidr = await input({ message: "Private subnet 1 CIDR:", default: NETWORKING_DEFAULTS.privateSubnet1Cidr });
+    out.privateSubnet2Cidr = await input({ message: "Private subnet 2 CIDR:", default: NETWORKING_DEFAULTS.privateSubnet2Cidr });
   }
-
-  return { nat, vpcCidr, publicSubnet1Cidr, publicSubnet2Cidr, privateSubnet1Cidr, privateSubnet2Cidr };
+  return out;
 }
 
 async function promptServices(): Promise<ServiceConfig[]> {
@@ -275,15 +297,13 @@ async function promptServices(): Promise<ServiceConfig[]> {
 
   console.log();
   dim("Service defaults applied:");
-  console.log();
   box([
-    `Health check interval:    ${ECS_DEFAULTS.healthCheckInterval} seconds`,
-    `Health check timeout:     ${ECS_DEFAULTS.healthCheckTimeout} seconds`,
-    `Healthy threshold:        ${ECS_DEFAULTS.healthyThreshold} consecutive checks`,
-    `Unhealthy threshold:      ${ECS_DEFAULTS.unhealthyThreshold} consecutive checks`,
+    `Health check interval:    ${ECS_DEFAULTS.healthCheckInterval}s`,
+    `Health check timeout:     ${ECS_DEFAULTS.healthCheckTimeout}s`,
+    `Healthy threshold:        ${ECS_DEFAULTS.healthyThreshold} checks`,
+    `Unhealthy threshold:      ${ECS_DEFAULTS.unhealthyThreshold} checks`,
     `Health check codes:       ${ECS_DEFAULTS.healthCheckCodes}`,
-    `Auto-scaling target:      ${ECS_DEFAULTS.autoScaleCpuTarget}% CPU utilization`,
-    `Deployment strategy:      rolling update`,
+    `Auto-scaling target:      ${ECS_DEFAULTS.autoScaleCpuTarget}% CPU`,
     `Circuit breaker:          enabled (auto-rollback)`,
     `ECS Exec:                 enabled`,
   ]);
@@ -349,7 +369,6 @@ async function promptDataStores(): Promise<DataStoreAnswers> {
       `Backup retention:      ${DATABASE_DEFAULTS.backupRetentionPeriod} days`,
       `Encryption:            enabled`,
       `Deletion protection:   enabled`,
-      `Subnets:               private subnets across 2 AZs`,
       `Access:                private subnet, ECS SG only`,
     ]);
     console.log();
@@ -410,74 +429,174 @@ async function promptDataStores(): Promise<DataStoreAnswers> {
   };
 }
 
-async function promptSecrets(project: string, env: string): Promise<HeizenConfig["smtp"]> {
-  section("Secrets & SMTP");
+async function promptAwsProfile(): Promise<string> {
+  section("AWS Profile");
+  dim("Used by deploy/destroy. Stored in heizen.env.yaml (gitignored).");
+  console.log();
+  return await input({ message: "AWS profile:", default: "default" });
+}
 
-  dim("Auto-generated secrets (stored in AWS Secrets Manager):");
-  console.log(`  • ${project}-${env}/db-password`);
-  console.log(`  • ${project}-${env}/better-auth-secret`);
+async function promptSecrets(services: ServiceConfig[]): Promise<HeizenEnvConfig["secrets"]> {
+  section("Secrets");
+  dim("Secrets are stored in AWS Secrets Manager.");
+  dim("Values are never stored in config files or git.");
+  dim("Secret values are prompted during first deploy only.");
   console.log();
 
-  const configureSmtp = await confirm({ message: "Configure SMTP for email?", default: false });
-  if (!configureSmtp) return undefined;
+  const serviceChoices = services.map((s) => ({
+    name: `${s.name} (${s.type})`,
+    value: s.name,
+    checked: s.type === "backend" || s.type === "worker",
+  }));
 
-  const host = await input({ message: "SMTP host:", default: "email-smtp.us-east-1.amazonaws.com" });
-  const port = await input({ message: "SMTP port:", default: "465" });
-  const user = await input({ message: "SMTP user:" });
-  const pass = await password({ message: "SMTP password:" });
-  const from = await input({ message: "From email:" });
-  const fromName = await input({ message: "From name:" });
+  console.log(chalk.bold("Auto-generated secrets (CLI creates random values):"));
+  const generated: SecretSpec[] = [
+    {
+      name: "db-password",
+      envVar: "DATABASE_PASSWORD",
+      services: services.filter((s) => s.type === "backend" || s.type === "worker").map((s) => s.name),
+    },
+    {
+      name: "better-auth-secret",
+      envVar: "BETTER_AUTH_SECRET",
+      services: services.filter((s) => s.type === "backend" || s.type === "worker").map((s) => s.name),
+    },
+  ];
+  for (const g of generated) {
+    console.log(`  • ${g.name} → ${g.envVar} (services: ${g.services.join(", ") || "—"})`);
+  }
+  console.log();
 
-  if (!process.env.HEIZEN_SMTP_CREDENTIALS) {
-    process.env.HEIZEN_SMTP_USER = user;
-    process.env.HEIZEN_SMTP_PASSWORD = pass;
+  while (true) {
+    const more = await confirm({
+      message: generated.length > 2 ? "Add another generated secret?" : "Add a generated secret?",
+      default: false,
+    });
+    if (!more) break;
+
+    const name = await input({
+      message: "Secret name (kebab-case, e.g., jwt-secret):",
+      validate: (v) => {
+        if (!isKebabCase(v)) return "Must be kebab-case.";
+        if (generated.some((s) => s.name === v)) return "Already added.";
+        return true;
+      },
+    });
+    const envVar = await input({
+      message: "Env var name:",
+      default: suggestEnvVar(name),
+      validate: (v) => isValidEnvVar(v) || "Must be UPPER_SNAKE_CASE.",
+    });
+    const selected = (await checkbox({
+      message: "Which services need this?",
+      choices: serviceChoices,
+    })) as string[];
+    generated.push({ name, envVar, services: selected });
   }
 
   console.log();
-  console.log(`  • ${project}-${env}/smtp-credentials (from your input)`);
+  console.log(chalk.bold("Manual secrets (you provide values during first deploy):"));
+  const manual: SecretSpec[] = [];
+  let isFirst = true;
+  while (true) {
+    const more = await confirm({
+      message: isFirst ? "Add a manual secret?" : "Add another manual secret?",
+      default: isFirst,
+    });
+    isFirst = false;
+    if (!more) break;
 
-  return { host, port, from, fromName };
+    const name = await input({
+      message: "Secret name (kebab-case, e.g., stripe-secret-key):",
+      validate: (v) => {
+        if (!isKebabCase(v)) return "Must be kebab-case.";
+        if (manual.some((s) => s.name === v)) return "Already added.";
+        if (generated.some((s) => s.name === v)) return "Already used by a generated secret.";
+        return true;
+      },
+    });
+    const envVar = await input({
+      message: "Env var name:",
+      default: suggestEnvVar(name),
+      validate: (v) => isValidEnvVar(v) || "Must be UPPER_SNAKE_CASE.",
+    });
+    const selected = (await checkbox({
+      message: "Which services need this?",
+      choices: serviceChoices,
+    })) as string[];
+    manual.push({ name, envVar, services: selected });
+  }
+
+  return { generated, manual };
 }
 
-function buildConfig(input: {
-  project: string;
-  env: string;
-  region: string;
-  awsProfile: string;
-  domain: string;
-  ecr: { image: string; tag: string };
-  networking: NetworkingAnswers;
-  services: ServiceConfig[];
-  database: HeizenConfig["database"];
-  cache: HeizenConfig["cache"];
-  storage: HeizenConfig["storage"];
-  smtp?: HeizenConfig["smtp"];
-}): HeizenConfig {
-  const config: HeizenConfig = {
-    version: 1,
-    project: input.project,
-    env: input.env,
-    region: input.region,
-    awsProfile: input.awsProfile,
-    domain: input.domain,
-    ecr: input.ecr,
-    services: input.services,
-    database: input.database,
-    cache: input.cache,
-    storage: input.storage,
-    networking: input.networking,
-  };
-  if (input.smtp) config.smtp = input.smtp;
-  return config;
+async function promptEnvVars(cfg: HeizenConfig): Promise<HeizenEnvConfig["env"]> {
+  section("Environment Variables");
+  dim("Non-sensitive configuration values.");
+  dim("Stored in heizen.env.yaml (gitignored).");
+  console.log();
+
+  dim("Auto-injected by infrastructure (you don't set these):");
+  const autoLines: string[] = [];
+  if (cfg.database.engine === "postgres") autoLines.push(`DATABASE_URL    = from RDS output     (auto)`);
+  if (cfg.cache.engine === "redis") autoLines.push(`REDIS_URL       = from Redis output   (auto)`);
+  if (cfg.storage.enabled) {
+    autoLines.push(`AWS_S3_BUCKET   = from S3 output      (auto)`);
+    autoLines.push(`AWS_S3_REGION   = ${cfg.region}            (auto)`);
+  }
+  autoLines.push(`NODE_ENV        = production          (auto)`);
+  box(autoLines);
+  console.log();
+
+  const env: HeizenEnvConfig["env"] = {};
+  const shared: Record<string, string> = {};
+
+  console.log(chalk.bold("Shared env vars (injected into all backend/worker services):"));
+  while (true) {
+    const more = await confirm({ message: "Add a shared variable?", default: false });
+    if (!more) break;
+    const key = await input({
+      message: "Key:",
+      validate: (v) => isValidEnvVar(v) || "Must be UPPER_SNAKE_CASE.",
+    });
+    const value = await input({ message: "Value:" });
+    shared[key] = value;
+  }
+  if (Object.keys(shared).length > 0) env.shared = shared;
+
+  for (const svc of cfg.services) {
+    console.log();
+    const addPerService = await confirm({
+      message: `Add env vars for "${svc.name}"?`,
+      default: false,
+    });
+    if (!addPerService) continue;
+
+    const perService: Record<string, string> = {};
+    while (true) {
+      const key = await input({
+        message: "Key:",
+        validate: (v) => isValidEnvVar(v) || "Must be UPPER_SNAKE_CASE.",
+      });
+      const value = await input({ message: "Value:" });
+      perService[key] = value;
+      const more = await confirm({ message: "Add another?", default: false });
+      if (!more) break;
+    }
+    if (Object.keys(perService).length > 0) env[svc.name] = perService;
+  }
+
+  return env;
 }
 
-function printSummary(cfg: HeizenConfig): void {
+function printSummary(cfg: HeizenConfig, envCfg: HeizenEnvConfig): void {
   section("Infrastructure Summary");
 
   console.log(`  Project:  ${cfg.project}`);
   console.log(`  Env:      ${cfg.env}`);
   console.log(`  Region:   ${cfg.region}`);
   console.log(`  Domain:   ${cfg.domain}`);
+  console.log(`  Profile:  ${envCfg.awsProfile}`);
   console.log();
 
   header("  Networking:");
@@ -488,13 +607,11 @@ function printSummary(cfg: HeizenConfig): void {
   const servicesWithDomain = cfg.services.filter((s) => s.domain);
   if (servicesWithDomain.length > 0) {
     header("  Load Balancer:");
-    console.log("    Application Load Balancer with host-based routing");
     console.log("    HTTP :80 → HTTPS redirect");
-    console.log("    HTTPS :443 routing:");
     for (const svc of servicesWithDomain) {
-      console.log(`      ${svc.domain} → ${svc.name} (port ${svc.port})`);
+      console.log(`    HTTPS: ${svc.domain} → ${svc.name} (port ${svc.port})`);
       if (svc.wildcard && svc.wildcardPort) {
-        console.log(`      *.${cfg.domain} → ${svc.name} (port ${svc.wildcardPort})`);
+        console.log(`    HTTPS: *.${cfg.domain} → ${svc.name} (port ${svc.wildcardPort})`);
       }
     }
     console.log(`    SSL: ACM wildcard certificate (*.${cfg.domain} + ${cfg.domain})`);
@@ -502,16 +619,10 @@ function printSummary(cfg: HeizenConfig): void {
   }
 
   header("  Compute:");
-  const colName = 14;
-  const colCpu = 12;
-  const colMem = 8;
-  const colRep = 10;
-  const colCost = 9;
-  console.log(`    ${padRight("Service", colName)} ${padRight("CPU", colCpu)} ${padRight("Memory", colMem)} ${padRight("Replicas", colRep)} ${padRight("Cost/mo", colCost)}`);
   for (const svc of cfg.services) {
     const p = CPU_PRESETS[svc.cpu];
     const cost = p.monthlyCost * svc.scaling.min;
-    console.log(`    ${padRight(svc.name, colName)} ${padRight(p.label.split(" / ")[0], colCpu)} ${padRight(p.label.split(" / ")[1] ?? "", colMem)} ${padRight(`${svc.scaling.min}-${svc.scaling.max}`, colRep)} ${padRight(`$${cost}`, colCost)}`);
+    console.log(`    ${padRight(svc.name, 14)} ${padRight(p.label, 22)} ${padRight(`${svc.scaling.min}-${svc.scaling.max}`, 10)} $${cost}/mo`);
   }
   console.log();
 
@@ -527,6 +638,15 @@ function printSummary(cfg: HeizenConfig): void {
   if (cfg.storage.enabled) console.log("    S3 bucket (versioning, AES-256, public access blocked)");
   console.log();
 
+  header("  Secrets:");
+  for (const s of envCfg.secrets.generated) {
+    console.log(`    ${chalk.dim("(generated)")} ${s.name} → ${s.envVar} → [${s.services.join(", ")}]`);
+  }
+  for (const s of envCfg.secrets.manual) {
+    console.log(`    ${chalk.dim("(manual)   ")} ${s.name} → ${s.envVar} → [${s.services.join(", ")}]`);
+  }
+  console.log();
+
   let total = 0;
   const lines: string[] = [];
   for (const svc of cfg.services) {
@@ -538,7 +658,6 @@ function printSummary(cfg: HeizenConfig): void {
   const natCost = NAT_PRESETS[cfg.networking.nat].monthlyCost;
   total += natCost;
   lines.push(`NAT Gateway (${cfg.networking.nat})         $${natCost.toFixed(2)}`);
-
   if (servicesWithDomain.length > 0) {
     total += ALB_MONTHLY_COST;
     lines.push(`Application Load Balancer        $${ALB_MONTHLY_COST.toFixed(2)}`);
@@ -561,24 +680,4 @@ function printSummary(cfg: HeizenConfig): void {
   header("  Estimated Monthly Cost:");
   box(lines);
   console.log();
-}
-
-function saveYaml(cfg: HeizenConfig): void {
-  const yamlPath = resolve(process.cwd(), "heizen.yaml");
-  const content = yaml.dump(cfg, { lineWidth: 120, noRefs: true });
-  writeFileSync(yamlPath, content, "utf8");
-  success(`Wrote heizen.yaml`);
-}
-
-async function installDeps(): Promise<void> {
-  const infraDir = resolve(process.cwd(), "infra");
-  if (!existsSync(infraDir)) return;
-
-  const spinner = ora("Installing dependencies...").start();
-  try {
-    await execa("npm", ["install"], { cwd: infraDir });
-    spinner.succeed("Dependencies installed");
-  } catch (e) {
-    spinner.fail("npm install failed (you can run 'npm install' manually in ./infra)");
-  }
 }

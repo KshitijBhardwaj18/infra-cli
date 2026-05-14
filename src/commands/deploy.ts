@@ -1,74 +1,87 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { execa, ExecaError } from "execa";
-import yaml from "js-yaml";
 import ora from "ora";
 import chalk from "chalk";
 
-import { validateConfig } from "../schema/validator.js";
-import { section, success, failure, info, dim, header, nextSteps } from "../ui.js";
+import { validateConfig, validateEnvConfig } from "../schema/validator.js";
+import { readConfig, readEnvConfig } from "../files.js";
+import { section, success, failure, info, header, nextSteps } from "../ui.js";
+import { resolveAndProvisionSecrets } from "../secrets.js";
 
 const DEFAULT_PASSPHRASE = "heizen-managed-passphrase";
 
 export async function runDeploy(): Promise<void> {
   const cwd = process.cwd();
-  const yamlPath = resolve(cwd, "heizen.yaml");
   const infraDir = resolve(cwd, "infra");
 
-  if (!existsSync(yamlPath)) {
+  const rawCfg = readConfig(cwd);
+  if (!rawCfg) {
     failure("heizen.yaml not found. Run 'heizen infra init' first.");
     process.exit(1);
   }
+  const rawEnv = readEnvConfig(cwd);
+  if (!rawEnv) {
+    failure("heizen.env.yaml not found. Run 'heizen infra init --env-only' first.");
+    process.exit(1);
+  }
   if (!existsSync(infraDir)) {
-    failure("infra/ directory not found. Run 'heizen infra init' first.");
+    failure("infra/ directory not found. Run 'heizen infra generate' first.");
     process.exit(1);
   }
 
-  const cfg = validateConfig(yaml.load(readFileSync(yamlPath, "utf8")));
+  const cfg = validateConfig(rawCfg);
+  const envCfg = validateEnvConfig(rawEnv);
+
   const passphrase = process.env.PULUMI_CONFIG_PASSPHRASE ?? DEFAULT_PASSPHRASE;
   const stateBucket = `${cfg.project}-pulumi-state`;
 
   section(`Deploying ${cfg.project} (${cfg.env})`);
   console.log(`  Region:  ${cfg.region}`);
-  console.log(`  Profile: ${cfg.awsProfile}`);
+  console.log(`  Profile: ${envCfg.awsProfile}`);
   console.log();
 
   const credSpinner = ora("Checking AWS credentials...").start();
   try {
     const { stdout } = await execa(
       "aws",
-      ["sts", "get-caller-identity", "--profile", cfg.awsProfile, "--output", "json"],
+      ["sts", "get-caller-identity", "--profile", envCfg.awsProfile, "--output", "json"],
     );
     const id = JSON.parse(stdout);
     credSpinner.succeed(`Authenticated as ${id.Arn} (account: ${id.Account})`);
-  } catch (e) {
-    credSpinner.fail(`AWS credentials not configured. Run 'aws configure --profile ${cfg.awsProfile}'`);
+  } catch {
+    credSpinner.fail(`AWS credentials not configured. Run 'aws configure --profile ${envCfg.awsProfile}'`);
     process.exit(1);
   }
+
+  console.log();
+  section("Secrets");
+  await resolveAndProvisionSecrets(cfg, envCfg);
+  console.log();
 
   const stateSpinner = ora("Setting up Pulumi state backend...").start();
   try {
     await execa(
       "aws",
-      ["s3api", "head-bucket", "--bucket", stateBucket, "--profile", cfg.awsProfile],
+      ["s3api", "head-bucket", "--bucket", stateBucket, "--profile", envCfg.awsProfile],
       { stderr: "ignore" },
     );
     stateSpinner.succeed(`Using existing state bucket: ${stateBucket}`);
   } catch {
     stateSpinner.text = `Creating state bucket: ${stateBucket}`;
     try {
-      const mbArgs = ["s3", "mb", `s3://${stateBucket}`, "--profile", cfg.awsProfile];
+      const mbArgs = ["s3", "mb", `s3://${stateBucket}`, "--profile", envCfg.awsProfile];
       if (cfg.region !== "us-east-1") mbArgs.push("--region", cfg.region);
       await execa("aws", mbArgs);
       await execa("aws", [
         "s3api", "put-bucket-versioning",
         "--bucket", stateBucket,
         "--versioning-configuration", "Status=Enabled",
-        "--profile", cfg.awsProfile,
+        "--profile", envCfg.awsProfile,
       ]);
       stateSpinner.succeed(`State bucket created: ${stateBucket}`);
     } catch (err) {
-      stateSpinner.fail(`Failed to create state bucket: ${stateBucket}`);
+      stateSpinner.fail(`Failed to create state bucket`);
       console.log(formatExecError(err));
       process.exit(1);
     }
@@ -77,7 +90,7 @@ export async function runDeploy(): Promise<void> {
   const env = {
     ...process.env,
     PULUMI_CONFIG_PASSPHRASE: passphrase,
-    AWS_PROFILE: cfg.awsProfile,
+    AWS_PROFILE: envCfg.awsProfile,
   };
 
   try {
@@ -119,7 +132,6 @@ export async function runDeploy(): Promise<void> {
   if (cfg.database.engine === "postgres") console.log(`  • RDS PostgreSQL (${cfg.database.size})`);
   if (cfg.cache.engine === "redis") console.log(`  • ElastiCache Redis (${cfg.cache.size})`);
   if (cfg.storage.enabled) console.log("  • S3 Bucket");
-  console.log("  • Secrets Manager");
   console.log(`  • ECS Cluster, ${cfg.services.length} Service(s), Auto-scaling`);
   console.log("  • CloudWatch Log Groups, IAM Roles");
   console.log();

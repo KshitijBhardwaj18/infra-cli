@@ -4,6 +4,7 @@ import chalk from "chalk";
 import { runInit } from "./commands/init.js";
 import { runDeploy } from "./commands/deploy.js";
 import { runDestroy } from "./commands/destroy.js";
+import { runGenerate } from "./commands/generate.js";
 const program = new Command();
 program
     .name("heizen")
@@ -12,10 +13,22 @@ program
 const infra = program.command("infra").description("Manage infrastructure");
 infra
     .command("init")
-    .description("Configure and generate infrastructure code")
+    .description("Configure project and generate infrastructure code")
+    .option("--env-only", "Configure heizen.env.yaml only (heizen.yaml must already exist)")
+    .action(async (opts) => {
+    try {
+        await runInit({ envOnly: !!opts.envOnly });
+    }
+    catch (err) {
+        handleError(err);
+    }
+});
+infra
+    .command("generate")
+    .description("Generate infra/ from heizen.yaml + heizen.env.yaml")
     .action(async () => {
     try {
-        await runInit();
+        await runGenerate();
     }
     catch (err) {
         handleError(err);
@@ -23,7 +36,7 @@ infra
 });
 infra
     .command("deploy")
-    .description("Deploy infrastructure to AWS")
+    .description("Provision secrets and deploy infrastructure to AWS")
     .action(async () => {
     try {
         await runDeploy();

@@ -10,39 +10,13 @@ import { privateSubnet1, privateSubnet2, rdsSg } from "./networking";
 import { privateSubnet1, privateSubnet2, redisSg } from "./networking";
 {{/if}}{{/if}}
 
-const dbPasswordSecret = new aws.secretsmanager.Secret(`${prefix}-db-password`, {
-  name: `${prefix}/db-password`,
-});
-
-export const dbPasswordValue = new aws.secretsmanager.SecretVersion(`${prefix}-db-password-value`, {
-  secretId: dbPasswordSecret.id,
-  secretString: pulumi.secret(crypto.randomBytes(24).toString("hex")),
-});
-
-const authSecretSecret = new aws.secretsmanager.Secret(`${prefix}-auth-secret`, {
-  name: `${prefix}/better-auth-secret`,
-});
-
-export const authSecretValue = new aws.secretsmanager.SecretVersion(`${prefix}-auth-secret-value`, {
-  secretId: authSecretSecret.id,
-  secretString: pulumi.secret(crypto.randomBytes(32).toString("hex")),
-});
-
-{{#if hasSmtp}}
-const smtpSecretSecret = new aws.secretsmanager.Secret(`${prefix}-smtp-credentials`, {
-  name: `${prefix}/smtp-credentials`,
-});
-
-export const smtpSecretValue = new aws.secretsmanager.SecretVersion(`${prefix}-smtp-credentials-value`, {
-  secretId: smtpSecretSecret.id,
-  secretString: pulumi.secret(JSON.stringify({
-    user: process.env.HEIZEN_SMTP_USER ?? "",
-    password: process.env.HEIZEN_SMTP_PASSWORD ?? "",
-  })),
-});
-{{/if}}
-
 {{#if hasDatabase}}
+const dbPasswordVersion = aws.secretsmanager.getSecretVersionOutput({
+  secretId: "{{database.dbPasswordSecretName}}",
+});
+
+export const dbPassword = dbPasswordVersion.secretString;
+
 const dbSubnetGroup = new aws.rds.SubnetGroup(`${prefix}-db-subnet`, {
   subnetIds: [privateSubnet1.id, privateSubnet2.id],
   tags: { Name: `${prefix}-db-subnet` },
@@ -57,7 +31,7 @@ export const db = new aws.rds.Instance(`${prefix}-db`, {
   storageType: "{{database.storageType}}",
   dbName: "{{database.dbName}}",
   username: "postgres",
-  password: dbPasswordValue.secretString.apply(s => s || ""),
+  password: dbPassword.apply(p => p || ""),
   dbSubnetGroupName: dbSubnetGroup.name,
   vpcSecurityGroupIds: [rdsSg.id],
   publiclyAccessible: false,
@@ -114,3 +88,8 @@ new aws.s3.BucketPublicAccessBlock(`${prefix}-files-block`, {
   restrictPublicBuckets: true,
 });
 {{/if}}
+
+{{#unless hasDatabase}}{{#unless hasCache}}{{#unless hasStorage}}
+// No managed data stores configured.
+const _placeholder = pulumi.output(prefix);
+{{/unless}}{{/unless}}{{/unless}}

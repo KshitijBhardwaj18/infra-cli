@@ -1,23 +1,29 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { execa, ExecaError } from "execa";
-import yaml from "js-yaml";
 import ora from "ora";
 import chalk from "chalk";
 import { input, confirm } from "@inquirer/prompts";
 
-import { validateConfig } from "../schema/validator.js";
+import { validateConfig, validateEnvConfig } from "../schema/validator.js";
+import { readConfig, readEnvConfig } from "../files.js";
 import { failure, success, warn, warnBox } from "../ui.js";
+import { deleteAllProjectSecrets } from "../secrets.js";
 
 const DEFAULT_PASSPHRASE = "heizen-managed-passphrase";
 
 export async function runDestroy(): Promise<void> {
   const cwd = process.cwd();
-  const yamlPath = resolve(cwd, "heizen.yaml");
   const infraDir = resolve(cwd, "infra");
 
-  if (!existsSync(yamlPath)) {
-    failure("heizen.yaml not found. Run 'heizen infra init' first.");
+  const rawCfg = readConfig(cwd);
+  if (!rawCfg) {
+    failure("heizen.yaml not found.");
+    process.exit(1);
+  }
+  const rawEnv = readEnvConfig(cwd);
+  if (!rawEnv) {
+    failure("heizen.env.yaml not found.");
     process.exit(1);
   }
   if (!existsSync(infraDir)) {
@@ -25,7 +31,9 @@ export async function runDestroy(): Promise<void> {
     process.exit(1);
   }
 
-  const cfg = validateConfig(yaml.load(readFileSync(yamlPath, "utf8")));
+  const cfg = validateConfig(rawCfg);
+  const envCfg = validateEnvConfig(rawEnv);
+
   const passphrase = process.env.PULUMI_CONFIG_PASSPHRASE ?? DEFAULT_PASSPHRASE;
   const stateBucket = `${cfg.project}-pulumi-state`;
 
@@ -47,7 +55,7 @@ export async function runDestroy(): Promise<void> {
   }
   if (cfg.cache.engine === "redis") warningLines.push("  • Redis Cache");
   if (cfg.storage.enabled) warningLines.push("  • S3 Bucket and all contents");
-  warningLines.push("  • Secrets, Logs, IAM Roles");
+  warningLines.push("  • CloudWatch Logs, IAM Roles");
   warningLines.push("");
   warningLines.push("This action CANNOT be undone.");
 
@@ -55,7 +63,7 @@ export async function runDestroy(): Promise<void> {
   warnBox(warningLines);
   console.log();
 
-  const typed = await input({ message: `Type the project name to confirm:` });
+  const typed = await input({ message: "Type the project name to confirm:" });
   if (typed !== cfg.project) {
     failure("Project name doesn't match. Aborting.");
     process.exit(1);
@@ -79,7 +87,7 @@ export async function runDestroy(): Promise<void> {
         "--db-instance-identifier", `${cfg.project}-${cfg.env}-db`,
         "--no-deletion-protection",
         "--apply-immediately",
-        "--profile", cfg.awsProfile,
+        "--profile", envCfg.awsProfile,
         "--region", cfg.region,
       ]);
       spinner.succeed("Deletion protection disabled");
@@ -93,7 +101,7 @@ export async function runDestroy(): Promise<void> {
   const env = {
     ...process.env,
     PULUMI_CONFIG_PASSPHRASE: passphrase,
-    AWS_PROFILE: cfg.awsProfile,
+    AWS_PROFILE: envCfg.awsProfile,
   };
 
   try {
@@ -114,11 +122,30 @@ export async function runDestroy(): Promise<void> {
     console.log(chalk.dim(formatExecError(err)));
     console.log();
     console.log("Some resources may not have been destroyed. Check the AWS Console.");
-    console.log("Run 'heizen infra destroy' again or manually delete remaining resources.");
     process.exit(1);
   }
 
   success("Infrastructure destroyed.");
+
+  const cleanSecrets = await confirm({
+    message: "Delete secrets from Secrets Manager?",
+    default: true,
+  });
+  if (cleanSecrets) {
+    const spinner = ora("Deleting secrets...").start();
+    try {
+      const deleted = await deleteAllProjectSecrets(cfg, envCfg.awsProfile);
+      spinner.stop();
+      if (deleted.length === 0) {
+        console.log(chalk.dim("  No secrets found to delete."));
+      } else {
+        for (const name of deleted) success(`Deleted secret: ${name}`);
+      }
+    } catch (err) {
+      spinner.fail("Failed to delete some secrets");
+      console.log(chalk.dim(formatExecError(err)));
+    }
+  }
 
   const deleteBucket = await confirm({
     message: `Delete Pulumi state bucket (${stateBucket})?`,
@@ -129,16 +156,16 @@ export async function runDestroy(): Promise<void> {
     try {
       await execa("aws", [
         "s3", "rb", `s3://${stateBucket}`, "--force",
-        "--profile", cfg.awsProfile, "--region", cfg.region,
+        "--profile", envCfg.awsProfile, "--region", cfg.region,
       ]);
       spinner.succeed("State bucket deleted");
-    } catch (err) {
+    } catch {
       spinner.fail("Could not delete state bucket (delete manually if needed)");
     }
   }
 
   console.log();
-  console.log("Cleanup complete. All resources have been destroyed.");
+  console.log("Cleanup complete.");
 }
 
 function formatExecError(err: unknown): string {
