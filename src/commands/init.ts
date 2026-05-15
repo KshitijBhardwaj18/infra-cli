@@ -1,4 +1,4 @@
-import { input, select, confirm, password, checkbox } from "@inquirer/prompts";
+import { input, select, confirm, password } from "@inquirer/prompts";
 import chalk from "chalk";
 
 import {
@@ -8,9 +8,9 @@ import {
 } from "../schema/presets.js";
 import type {
   HeizenConfig, HeizenEnvConfig, ServiceConfig, CpuSize, DbSize, CacheSize,
-  NatMode, ServiceType, SecretSpec,
+  NatMode, ServiceType,
 } from "../schema/types.js";
-import { isKebabCase, isValidDomain, isValidEnvVar, suggestEnvVar } from "../schema/validator.js";
+import { isKebabCase, isValidDomain, isValidEnvVar } from "../schema/validator.js";
 import { section, box, success, info, dim, header, nextSteps, padRight, failure } from "../ui.js";
 import { writeConfig, writeEnvConfig, readConfig, ensureGitignore } from "../files.js";
 import { runGenerate } from "./generate.js";
@@ -31,10 +31,9 @@ export async function runInit(opts: { envOnly?: boolean } = {}): Promise<void> {
     dim("Configuring runtime (heizen.env.yaml) only. Infrastructure shape (heizen.yaml) untouched.");
 
     const awsProfile = await promptAwsProfile();
-    const secrets = await promptSecrets(cfg.services);
-    const env = await promptEnvVars(cfg);
+    const { generate, secrets, env } = await promptRuntimeConfig(cfg);
 
-    const envCfg: HeizenEnvConfig = { awsProfile, secrets, env };
+    const envCfg: HeizenEnvConfig = { awsProfile, generate, secrets, env };
     writeEnvConfig(envCfg);
     ensureGitignore();
     success("Wrote heizen.env.yaml");
@@ -64,10 +63,9 @@ export async function runInit(opts: { envOnly?: boolean } = {}): Promise<void> {
   };
 
   const awsProfile = await promptAwsProfile();
-  const secrets = await promptSecrets(services);
-  const env = await promptEnvVars(cfg);
+  const { generate, secrets, env } = await promptRuntimeConfig(cfg);
 
-  const envCfg: HeizenEnvConfig = { awsProfile, secrets, env };
+  const envCfg: HeizenEnvConfig = { awsProfile, generate, secrets, env };
 
   printSummary(cfg, envCfg);
 
@@ -445,117 +443,95 @@ async function promptAwsProfile(): Promise<string> {
   return await input({ message: "AWS profile:", default: "default" });
 }
 
-async function promptSecrets(services: ServiceConfig[]): Promise<SecretSpec[]> {
-  section("Secrets");
-  dim("Secrets are stored in Pulumi encrypted config (per stack, never plaintext).");
-  dim("Auto-generated secrets get random values on first deploy.");
-  dim("Manual secrets can have a value here (file is gitignored) or be prompted during deploy.");
-  console.log();
-
-  const serviceChoices = services.map((s) => ({
-    name: `${s.name} (${s.type})`,
-    value: s.name,
-    checked: s.type === "backend" || s.type === "worker",
-  }));
-
-  const secrets: SecretSpec[] = [];
-
-  const hasDbConsumers = services.some((s) => s.type === "backend" || s.type === "worker");
-  if (hasDbConsumers) {
-    secrets.push({
-      name: "db-password",
-      envVar: "DATABASE_PASSWORD",
-      services: [],
-      generate: true,
-    });
-    console.log(chalk.bold("Infrastructure secrets (auto-managed):"));
-    box([
-      `DB_PASSWORD    auto-generated, wired to DATABASE_URL`,
-    ]);
-    console.log();
-  }
-
-  while (true) {
-    const more = await confirm({
-      message: secrets.length > 0 ? "Add another secret?" : "Add a secret?",
-      default: false,
-    });
-    if (!more) break;
-
-    const kind = await select({
-      message: "Secret kind:",
-      choices: [
-        { name: "generated — CLI creates a random value on first deploy", value: "generated" },
-        { name: "manual    — you provide the value (now or during deploy)", value: "manual" },
-      ],
-    });
-
-    const name = await input({
-      message: "Secret name (kebab-case, e.g., stripe-secret-key):",
-      validate: (v) => {
-        if (!isKebabCase(v)) return "Must be kebab-case.";
-        if (secrets.some((s) => s.name === v)) return "Already added.";
-        return true;
-      },
-    });
-    const envVar = await input({
-      message: "Env var name:",
-      default: suggestEnvVar(name),
-      validate: (v) => isValidEnvVar(v) || "Must be UPPER_SNAKE_CASE.",
-    });
-    const selected = (await checkbox({
-      message: "Which services need this?",
-      choices: serviceChoices,
-    })) as string[];
-
-    if (kind === "generated") {
-      secrets.push({ name, envVar, services: selected, generate: true });
-    } else {
-      const provideNow = await confirm({
-        message: "Provide the value now? (stored in gitignored heizen.env.yaml)",
-        default: false,
-      });
-      let value: string | undefined;
-      if (provideNow) {
-        value = await password({
-          message: `Value for ${envVar}:`,
-          mask: "*",
-          validate: (v) => v.length > 0 || "A value is required.",
-        });
-      }
-      const spec: SecretSpec = { name, envVar, services: selected };
-      if (value) spec.value = value;
-      secrets.push(spec);
-    }
-  }
-
-  return secrets;
+interface RuntimeConfig {
+  generate: string[];
+  secrets: Record<string, string>;
+  env: HeizenEnvConfig["env"];
 }
 
-async function promptEnvVars(cfg: HeizenConfig): Promise<HeizenEnvConfig["env"]> {
+async function promptRuntimeConfig(cfg: HeizenConfig): Promise<RuntimeConfig> {
   section("Environment Variables");
-  dim("Non-sensitive configuration values.");
-  dim("Stored in heizen.env.yaml (gitignored).");
+  dim("All runtime configuration lives in heizen.env.yaml (gitignored).");
   console.log();
 
-  dim("Auto-injected by infrastructure (you don't set these):");
   const autoLines: string[] = [];
-  if (cfg.database.engine === "postgres") autoLines.push(`DATABASE_URL    = from RDS output     (auto)`);
-  if (cfg.cache.engine === "redis") autoLines.push(`REDIS_URL       = from Redis output   (auto)`);
+  if (cfg.database.engine === "postgres") autoLines.push(`DATABASE_URL    from RDS output`);
+  if (cfg.cache.engine === "redis") autoLines.push(`REDIS_URL       from Redis output`);
   if (cfg.storage.enabled) {
-    autoLines.push(`AWS_S3_BUCKET   = from S3 output      (auto)`);
-    autoLines.push(`AWS_S3_REGION   = ${cfg.region}            (auto)`);
+    autoLines.push(`AWS_S3_BUCKET   from S3 output`);
+    autoLines.push(`AWS_S3_REGION   ${cfg.region}`);
   }
-  autoLines.push(`NODE_ENV        = production          (auto)`);
+  autoLines.push(`NODE_ENV        production`);
+  console.log(chalk.bold("Auto-injected by infrastructure (you don't set these):"));
   box(autoLines);
   console.log();
 
-  const env: HeizenEnvConfig["env"] = {};
-  const shared: Record<string, string> = {};
+  const hasBackendOrWorker = cfg.services.some((s) => s.type === "backend" || s.type === "worker");
+  if (hasBackendOrWorker && cfg.database.engine === "postgres") {
+    console.log(chalk.bold("Infrastructure secret (auto-managed):"));
+    box([`DB_PASSWORD     auto-generated, wired into DATABASE_URL`]);
+    console.log();
+  }
 
-  console.log(chalk.bold("Shared env vars (injected into all backend/worker services):"));
+  const generate: string[] = [];
+  const secrets: Record<string, string> = {};
+  const env: HeizenEnvConfig["env"] = {};
+
+  console.log(chalk.bold("Generated values (random hex, encrypted in Pulumi config):"));
+  dim("Use for things like AUTH_SECRET, SESSION_SECRET — values you want random.");
   while (true) {
-    const more = await confirm({ message: "Add a shared variable?", default: false });
+    const more = await confirm({
+      message: generate.length > 0 ? "Add another generated variable?" : "Add a generated variable?",
+      default: false,
+    });
+    if (!more) break;
+    const name = await input({
+      message: "Env var name:",
+      validate: (v) => {
+        if (!isValidEnvVar(v)) return "Must be UPPER_SNAKE_CASE.";
+        if (generate.includes(v)) return "Already added.";
+        if (v in secrets) return "Already declared as a sensitive value.";
+        return true;
+      },
+    });
+    generate.push(name);
+  }
+  console.log();
+
+  console.log(chalk.bold("Sensitive values (you provide; encrypted in Pulumi config):"));
+  dim("API keys, SMTP credentials, third-party tokens. Hidden input.");
+  while (true) {
+    const more = await confirm({
+      message: Object.keys(secrets).length > 0 ? "Add another sensitive value?" : "Add a sensitive value?",
+      default: false,
+    });
+    if (!more) break;
+    const key = await input({
+      message: "Env var name:",
+      validate: (v) => {
+        if (!isValidEnvVar(v)) return "Must be UPPER_SNAKE_CASE.";
+        if (v in secrets) return "Already added.";
+        if (generate.includes(v)) return "Already declared as a generated value.";
+        return true;
+      },
+    });
+    const value = await password({
+      message: `Value for ${key}:`,
+      mask: "*",
+      validate: (v) => v.length > 0 || "A value is required.",
+    });
+    secrets[key] = value;
+  }
+  console.log();
+
+  console.log(chalk.bold("Shared config (plain values for all backend/worker services):"));
+  dim("Non-sensitive. Hostnames, ports, CORS origins, etc.");
+  const shared: Record<string, string> = {};
+  while (true) {
+    const more = await confirm({
+      message: Object.keys(shared).length > 0 ? "Add another shared variable?" : "Add a shared variable?",
+      default: false,
+    });
     if (!more) break;
     const key = await input({
       message: "Key:",
@@ -565,9 +541,10 @@ async function promptEnvVars(cfg: HeizenConfig): Promise<HeizenEnvConfig["env"]>
     shared[key] = value;
   }
   if (Object.keys(shared).length > 0) env.shared = shared;
+  console.log();
 
+  console.log(chalk.bold("Per-service config:"));
   for (const svc of cfg.services) {
-    console.log();
     const addPerService = await confirm({
       message: `Add env vars for "${svc.name}"?`,
       default: false,
@@ -588,7 +565,7 @@ async function promptEnvVars(cfg: HeizenConfig): Promise<HeizenEnvConfig["env"]>
     if (Object.keys(perService).length > 0) env[svc.name] = perService;
   }
 
-  return env;
+  return { generate, secrets, env };
 }
 
 function printSummary(cfg: HeizenConfig, envCfg: HeizenEnvConfig): void {
@@ -640,10 +617,25 @@ function printSummary(cfg: HeizenConfig, envCfg: HeizenEnvConfig): void {
   if (cfg.storage.enabled) console.log("    S3 bucket (versioning, AES-256, private)");
   console.log();
 
-  header("  Secrets:");
-  for (const s of envCfg.secrets) {
-    const kind = s.generate ? chalk.dim("(generated)") : (s.value ? chalk.dim("(value set) ") : chalk.dim("(manual)   "));
-    console.log(`    ${kind} ${s.name} → ${s.envVar} → [${s.services.join(", ")}]`);
+  header("  Runtime config:");
+  if (cfg.database.engine === "postgres") {
+    console.log(`    ${chalk.dim("(infra)    ")} DB_PASSWORD`);
+  }
+  for (const name of envCfg.generate) {
+    console.log(`    ${chalk.dim("(generated)")} ${name}`);
+  }
+  for (const key of Object.keys(envCfg.secrets)) {
+    console.log(`    ${chalk.dim("(secret)   ")} ${key}`);
+  }
+  for (const [key] of Object.entries(envCfg.env.shared ?? {})) {
+    console.log(`    ${chalk.dim("(shared)   ")} ${key}`);
+  }
+  for (const svc of cfg.services) {
+    const vars = envCfg.env[svc.name];
+    if (!vars) continue;
+    for (const key of Object.keys(vars)) {
+      console.log(`    ${chalk.dim(`(${svc.name})`.padEnd(11))} ${key}`);
+    }
   }
   console.log();
 

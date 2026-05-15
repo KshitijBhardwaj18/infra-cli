@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import Handlebars from "handlebars";
 import ora from "ora";
 
-import type { HeizenConfig, HeizenEnvConfig, ServiceConfig, SecretSpec } from "../schema/types.js";
+import type { HeizenConfig, HeizenEnvConfig, ServiceConfig } from "../schema/types.js";
 import {
   CPU_PRESETS, DB_PRESETS, CACHE_PRESETS,
   NETWORKING_DEFAULTS, DATABASE_DEFAULTS, CACHE_DEFAULTS, ECS_DEFAULTS,
@@ -152,13 +152,21 @@ function buildTemplateContext(cfg: HeizenConfig, envCfg: HeizenEnvConfig): Templ
   const hasStorage = cfg.storage.enabled;
   const dbName = cfg.database.dbName ?? cfg.project.replace(/-/g, "_");
 
-  const dbPasswordSpec = envCfg.secrets.find((s) => s.envVar === "DATABASE_PASSWORD") ?? envCfg.secrets.find((s) => s.name === "db-password");
-  const dbPasswordConfigVar = dbPasswordSpec ? pulumiKeyFromEnvVar(dbPasswordSpec.envVar) : "dbPassword";
+  const dbPasswordConfigVar = "dbPassword";
 
-  const allSecretConfigs = envCfg.secrets.map((s) => ({
-    envVar: s.envVar,
-    configVar: pulumiKeyFromEnvVar(s.envVar),
-  }));
+  // Env vars injected into all backend/worker services from Pulumi config.
+  // Order: generated random values first, then user-provided secret values.
+  const injectedSecretVars: Array<{ envVar: string; configVar: string }> = [
+    ...envCfg.generate.map((envVar) => ({ envVar, configVar: pulumiKeyFromEnvVar(envVar) })),
+    ...Object.keys(envCfg.secrets).map((envVar) => ({ envVar, configVar: pulumiKeyFromEnvVar(envVar) })),
+  ];
+
+  // store.ts exports: dbPassword (if database) + every injected secret var.
+  const allSecretConfigs: Array<{ envVar: string; configVar: string }> = [];
+  if (hasDatabase) {
+    allSecretConfigs.push({ envVar: "DATABASE_PASSWORD", configVar: dbPasswordConfigVar });
+  }
+  for (const v of injectedSecretVars) allSecretConfigs.push(v);
 
   const services: ServiceCtx[] = cfg.services.map((s) => {
     const preset = CPU_PRESETS[s.cpu];
@@ -198,7 +206,7 @@ function buildTemplateContext(cfg: HeizenConfig, envCfg: HeizenEnvConfig): Templ
 
   for (const svc of services) {
     populateServiceEnv(svc, envCfg, hasDatabase, hasCache, hasStorage, byName);
-    populateServiceSecrets(svc, envCfg, byName);
+    populateServiceSecrets(svc, injectedSecretVars);
     buildPulumiAllSources(svc, dbPasswordConfigVar);
   }
 
@@ -335,31 +343,15 @@ function populateServiceEnv(
 
 function populateServiceSecrets(
   svc: ServiceCtx,
-  envCfg: HeizenEnvConfig,
-  byName: Map<string, ServiceCtx>,
+  injectedSecretVars: Array<{ envVar: string; configVar: string }>,
 ): void {
-  const collected = new Map<string, { envVar: string; configVar: string }>();
-
-  for (const spec of envCfg.secrets) {
-    if (spec.name === "db-password") continue;
-    if (spec.services.includes(svc.name)) {
-      collected.set(spec.envVar, {
-        envVar: spec.envVar,
-        configVar: pulumiKeyFromEnvVar(spec.envVar),
-      });
-    }
+  // generate[] and secrets{} are injected into every backend/worker service.
+  // Frontends only get PORT plus their own per-service env literals.
+  if (!svc.receivesBackendEnv) {
+    svc.secretConfigVars = [];
+    return;
   }
-
-  if (svc.inheritEnvFrom) {
-    const parent = byName.get(svc.inheritEnvFrom);
-    if (parent) {
-      for (const s of parent.secretConfigVars) {
-        if (!collected.has(s.envVar)) collected.set(s.envVar, s);
-      }
-    }
-  }
-
-  svc.secretConfigVars = Array.from(collected.values());
+  svc.secretConfigVars = injectedSecretVars.slice();
 }
 
 function buildPulumiAllSources(svc: ServiceCtx, dbPasswordConfigVar: string): void {

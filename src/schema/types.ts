@@ -59,17 +59,17 @@ export interface HeizenConfig {
   };
 }
 
-export interface SecretSpec {
-  name: string;
-  envVar: string;
-  services: string[];
-  generate?: boolean;
-  value?: string;
-}
-
 export interface HeizenEnvConfig {
   awsProfile: string;
-  secrets: SecretSpec[];
+  // Env var names that get an auto-generated random hex value on first deploy.
+  // Stored encrypted in Pulumi config (config.requireSecret).
+  generate: string[];
+  // User-provided sensitive values keyed by env var name.
+  // Stored encrypted in Pulumi config (config.requireSecret).
+  secrets: Record<string, string>;
+  // Non-sensitive config baked into the generated TypeScript as literals.
+  // `shared` is injected into all backend/worker services.
+  // `[serviceName]` is injected into that service only.
   env: {
     shared?: Record<string, string>;
     [serviceName: string]: Record<string, string> | undefined;

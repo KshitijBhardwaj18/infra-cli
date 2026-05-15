@@ -37,8 +37,21 @@ export function validateEnvConfig(raw: unknown): HeizenEnvConfig {
   }
   const c = raw as Record<string, any>;
   if (!c.awsProfile) throw new Error("heizen.env.yaml missing awsProfile");
-  if (!Array.isArray(c.secrets)) c.secrets = [];
+  if (!Array.isArray(c.generate)) c.generate = [];
+  if (!c.secrets || typeof c.secrets !== "object" || Array.isArray(c.secrets)) c.secrets = {};
   if (!c.env || typeof c.env !== "object") c.env = {};
+
+  for (const name of c.generate) {
+    if (typeof name !== "string" || !isValidEnvVar(name)) {
+      throw new Error(`heizen.env.yaml: generate entry "${name}" must be UPPER_SNAKE_CASE`);
+    }
+  }
+  for (const key of Object.keys(c.secrets)) {
+    if (!isValidEnvVar(key)) {
+      throw new Error(`heizen.env.yaml: secrets key "${key}" must be UPPER_SNAKE_CASE`);
+    }
+  }
+
   return c as HeizenEnvConfig;
 }
 
@@ -48,10 +61,6 @@ export function isKebabCase(value: string): boolean {
 
 export function isValidDomain(value: string): boolean {
   return /^([a-z0-9-]+\.)+[a-z]{2,}$/i.test(value);
-}
-
-export function suggestEnvVar(secretName: string): string {
-  return secretName.replace(/-/g, "_").toUpperCase();
 }
 
 export function isValidEnvVar(value: string): boolean {
