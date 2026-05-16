@@ -1,13 +1,13 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
-import { prefix, region, rootDomain, ecrImage{{#each servicesWithDomain}}, {{camel name}}Domain{{/each}} } from "../config";
+import { prefix, region, ecrImage } from "../config";
 import { privateSubnet1, privateSubnet2, ecsSg } from "./networking";
-{{#if hasAnySecrets}}
+{{#if hasConfigExports}}
 import {
 {{#if hasDatabase}}  db,
 {{/if}}{{#if hasCache}}  redis,
 {{/if}}{{#if hasStorage}}  bucket,
-{{/if}}{{#each allSecretConfigs}}  {{configVar}},
+{{/if}}{{#each configExports}}  {{configVar}},
 {{/each}}
 } from "./store";
 {{else}}
@@ -44,23 +44,6 @@ const executionRole = new aws.iam.Role(`${prefix}-ecs-execution-role`, {
 new aws.iam.RolePolicyAttachment(`${prefix}-ecs-execution-policy`, {
   role: executionRole.name,
   policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
-});
-
-new aws.iam.RolePolicy(`${prefix}-ecr-cross-account`, {
-  role: executionRole.name,
-  policy: JSON.stringify({
-    Version: "2012-10-17",
-    Statement: [{
-      Effect: "Allow",
-      Action: [
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:BatchGetImage",
-      ],
-      Resource: "*",
-    }],
-  }),
 });
 
 {{#if hasStorage}}
@@ -128,8 +111,7 @@ const {{camel name}}Environment = pulumi.all([
 {{/if}}{{#if envFromRedis}}  out.push({ name: "REDIS_URL", value: `redis://${rHost}:${rPort}` });
 {{/if}}{{#if envFromBucket}}  out.push({ name: "AWS_S3_BUCKET", value: `${bucketName}` });
 {{/if}}{{#if envFromRegion}}  out.push({ name: "AWS_S3_REGION", value: region });
-{{/if}}{{#each secretConfigVars}}  out.push({ name: "{{envVar}}", value: `${ {{~configVar}}Val }` });
-{{/each}}{{#each envLiteral}}  out.push({ name: "{{name}}", value: {{jsonString value}} });
+{{/if}}{{#each configVars}}  out.push({ name: "{{envVar}}", value: `${ {{~configVar}}Val }` });
 {{/each}}{{#if isFrontend}}  out.push({ name: "PORT", value: "{{port}}" });
 {{/if}}  return out;
 });

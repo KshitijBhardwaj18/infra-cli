@@ -9,10 +9,10 @@ import { privateSubnet1, privateSubnet2, rdsSg } from "./networking";
 import { privateSubnet1, privateSubnet2, redisSg } from "./networking";
 {{/if}}{{/if}}
 
-{{#if hasAnySecrets}}
+{{#if hasConfigExports}}
 const config = new pulumi.Config();
 
-{{#each allSecretConfigs}}
+{{#each configExports}}
 export const {{configVar}} = config.requireSecret("{{configVar}}");
 {{/each}}
 {{/if}}
