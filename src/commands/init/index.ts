@@ -95,8 +95,10 @@ async function collectInfraConfig(): Promise<HeizenConfig> {
 
 async function collectEnvConfig(cfg: HeizenConfig): Promise<HeizenEnvConfig> {
   const awsProfile = await promptAwsProfile();
-  const env = await promptEnv(cfg);
-  return { awsProfile, env };
+  const { env, heizenStudio } = await promptEnv(cfg);
+  return heizenStudio
+    ? { awsProfile, heizenStudio, env }
+    : { awsProfile, env };
 }
 
 function persistInfraConfig(cfg: HeizenConfig): void {

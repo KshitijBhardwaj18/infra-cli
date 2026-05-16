@@ -61,11 +61,23 @@ export interface HeizenConfig {
   };
 }
 
+export interface HeizenStudioConfig {
+  projectId: string;
+  environment: string;
+  apiKey: string;
+}
+
 // All env vars live here. A value of AUTO_VALUE ("auto") means
 // "generate a random hex secret on first deploy". Any other string is the
 // literal value. All values are stored encrypted in Pulumi config.
+//
+// `heizenStudio`, when set, records that env.shared was sourced from
+// studio.heizen.work. The values themselves still live in env.shared, so
+// deploy/generate need no special handling. A future `refresh` command can
+// re-fetch using these credentials.
 export interface HeizenEnvConfig {
   awsProfile: string;
+  heizenStudio?: HeizenStudioConfig;
   env: {
     shared?: Record<string, string>;
     [serviceName: string]: Record<string, string> | undefined;

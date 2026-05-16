@@ -45,6 +45,7 @@ export function validateEnvConfig(raw: unknown): HeizenEnvConfig {
   if (typeof c.awsProfile !== "string" || !c.awsProfile) {
     throw new Error("heizen.env.yaml missing awsProfile");
   }
+  if (c.heizenStudio !== undefined) validateHeizenStudio(c.heizenStudio);
   if (!c.env || typeof c.env !== "object") c.env = {};
 
   const env = c.env as Record<string, Record<string, string> | undefined>;
@@ -86,6 +87,18 @@ export function isValidDomain(value: string): boolean {
 
 export function isValidEnvVar(value: string): boolean {
   return /^[A-Z_][A-Z0-9_]*$/.test(value);
+}
+
+function validateHeizenStudio(raw: unknown): void {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("heizen.env.yaml: heizenStudio must be an object");
+  }
+  const s = raw as Record<string, unknown>;
+  for (const field of ["projectId", "environment", "apiKey"] as const) {
+    if (typeof s[field] !== "string" || !(s[field] as string).trim()) {
+      throw new Error(`heizen.env.yaml: heizenStudio.${field} must be a non-empty string`);
+    }
+  }
 }
 
 // AUTH_SECRET -> authSecret. Used as the Pulumi config key for an env var.
