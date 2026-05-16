@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import chalk from "chalk";
 
-import { handleError } from "./cli/errors.js";
 import { runDeploy } from "./commands/deploy/index.js";
 import { runDestroy } from "./commands/destroy/index.js";
 import { runGenerate } from "./commands/generate/index.js";
@@ -40,3 +40,15 @@ infra
   .action(() => runDestroy().catch(handleError));
 
 program.parseAsync(process.argv);
+
+function handleError(err: unknown): never {
+  if (err instanceof Error && err.name === "ExitPromptError") {
+    console.log();
+    console.log(chalk.yellow("Cancelled."));
+    process.exit(0);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  console.log();
+  console.log(chalk.red(`✗ ${message}`));
+  process.exit(1);
+}
