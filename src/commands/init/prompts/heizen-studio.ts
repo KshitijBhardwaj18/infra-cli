@@ -4,7 +4,7 @@ import type { SecretsMap } from "@heizen-labs/secrets-sdk";
 import ora from "ora";
 
 import type { HeizenStudioConfig } from "../../../schema/types.js";
-import { failure, info } from "../../../ui/index.js";
+import { failure, info, warn } from "../../../ui/index.js";
 
 export interface StudioFetchResult {
   credentials: HeizenStudioConfig;
@@ -57,7 +57,13 @@ async function fetchSecrets(credentials: HeizenStudioConfig): Promise<SecretsMap
   try {
     const client = new SecretsClient(credentials);
     const secrets = await client.getSecrets();
-    spinner.succeed(`Found ${Object.keys(secrets).length} env vars`);
+    const count = Object.keys(secrets).length;
+    if (count === 0) {
+      spinner.warn(`Studio returned 0 env vars for project "${credentials.projectId}" / environment "${credentials.environment}"`);
+      warn("Double-check the project ID and environment in studio.heizen.work — and that variables are stored as key-value entries.");
+      return null;
+    }
+    spinner.succeed(`Found ${count} env vars`);
     return secrets;
   } catch (err) {
     spinner.fail("Could not fetch secrets from Heizen Studio");

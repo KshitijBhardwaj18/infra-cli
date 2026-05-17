@@ -29,3 +29,8 @@ heizen.env.yaml
 .vscode/
 .idea/
 *.swp
+
+# Heizen
+infra/node_modules
+infra/bin
+infra/Pulumi.*.yaml
