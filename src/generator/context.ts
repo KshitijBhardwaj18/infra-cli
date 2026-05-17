@@ -126,9 +126,11 @@ function buildBaseServiceCtx(s: ServiceConfig): ServiceCtx {
   };
 }
 
-// Frontends only get their own per-service env vars.
-// Backends/workers get env.shared, their own per-service vars, plus any
-// parent's vars (via inheritEnvFrom). Duplicates resolved by first-write-wins.
+// All services get env.shared vars plus their own per-service vars.
+// Backends/workers additionally get auto-injected infrastructure vars
+// (DATABASE_URL, REDIS_URL, S3, NODE_ENV) via setAutoInjectedFlags().
+// inheritEnvFrom merges a parent service's config vars.
+// Duplicates resolved by first-write-wins.
 function resolveConfigVars(
   svc: ServiceCtx,
   envCfg: HeizenEnvConfig,
@@ -146,7 +148,7 @@ function resolveConfigVars(
     }
   };
 
-  if (svc.receivesBackendEnv) add(envCfg.env.shared);
+  add(envCfg.env.shared);
   if (svc.inheritEnvFrom) {
     const parent = byName.get(svc.inheritEnvFrom);
     if (parent) {
